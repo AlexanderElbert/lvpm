@@ -401,9 +401,16 @@ enum Cmd {
     List,
     /// Search the indexes.
     Search { query: String },
-    /// Build the package the `[package]` table of an `lvpm.toml` describes,
-    /// without LabVIEW or VIPM.
-    Pack {
+    /// Work with the package the `[package]` table of an `lvpm.toml`
+    /// describes.
+    #[command(subcommand)]
+    Package(PackageCmd),
+}
+
+#[derive(Subcommand)]
+enum PackageCmd {
+    /// Build the package, without LabVIEW or VIPM.
+    Build {
         /// The manifest; default: the nearest `lvpm.toml` at or above here.
         #[arg(long, value_name = "FILE")]
         manifest: Option<PathBuf>,
@@ -556,8 +563,8 @@ fn run(cli: &Cli) -> Result<()> {
         Cmd::Import { file, all, group, dry_run } => cmd_import(&cli, file, *all, group.as_deref(), *dry_run),
         Cmd::List => cmd_list(&cli),
         Cmd::Search { query } => cmd_search(&cli, query),
-        Cmd::Pack { manifest, output, set_version } => {
-            cmd_pack(manifest.as_deref(), output.as_deref(), set_version.as_deref())
+        Cmd::Package(PackageCmd::Build { manifest, output, set_version }) => {
+            cmd_package_build(manifest.as_deref(), output.as_deref(), set_version.as_deref())
         }
     }
 }
@@ -571,7 +578,7 @@ fn took(d: std::time::Duration) -> String {
     }
 }
 
-fn cmd_pack(manifest: Option<&Path>, output: Option<&Path>, set_version: Option<&str>) -> Result<()> {
+fn cmd_package_build(manifest: Option<&Path>, output: Option<&Path>, set_version: Option<&str>) -> Result<()> {
     let path = match manifest {
         Some(p) => p.to_path_buf(),
         None => project::find_manifest(&std::env::current_dir()?)
@@ -588,7 +595,7 @@ fn cmd_pack(manifest: Option<&Path>, output: Option<&Path>, set_version: Option<
         pkg.output = o.to_path_buf();
     }
     let out = pkg.build()?;
-    println!("packed {} {} ({} files)", pkg.name, pkg.version, pkg.files.len());
+    println!("built {} {} ({} files)", pkg.name, pkg.version, pkg.files.len());
     for (file, _) in &pkg.files {
         println!("  {file}");
     }
