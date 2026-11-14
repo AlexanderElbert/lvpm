@@ -2221,7 +2221,7 @@ fn cmd_venv(cli: &Cli, sub: &VenvCmd) -> Result<()> {
                 let shadowed = shadow::find(&v, &installed);
                 match shadowed.is_empty() {
                     true => log!("  shadowed       none: LabVIEW has no copy of its own of any of them"),
-                    false => log!("  shadowed       {} also in {} (below)", shadowed.len(), v.target.label()),
+                    false => log!("  shadowed       {} also in LabVIEW {} (below)", shadowed.len(), v.target.year()),
                 }
                 shadow::warn(&v, &shadowed);
                 Ok(())

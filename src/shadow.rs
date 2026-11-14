@@ -90,44 +90,28 @@ pub fn warn(v: &Venv, shadowed: &[Shadowed]) {
     if shadowed.is_empty() {
         return;
     }
-    let lv = v.target.label();
+    let lv = format!("LabVIEW {}", v.target.year());
     ewlog!(
-        "\nwarning: {lv} has its own copy of {} package(s) in this venv. LabVIEW loads the\n         \
-         installation's copy, whatever version the venv has, and shows both copies' menu entries:",
-        shadowed.len()
+        "\nwarning: {lv} has its own copy of {} package{} in this venv, and loads that copy instead:",
+        shadowed.len(),
+        if shadowed.len() == 1 { "" } else { "s" }
     );
-    let width = shadowed.iter().map(|s| s.name.len() + s.version.len()).max().unwrap_or(0) + 1;
+    let width = shadowed.iter().map(|s| s.name.len()).max().unwrap_or(0);
     for s in shadowed {
+        ewlog!("  {:<width$}  {}", s.name, s.version);
+        // The evidence, for the log only.
         let at: PathBuf = std::iter::once(v.target.path.clone())
             .chain(s.example.split('/').map(PathBuf::from))
             .collect();
-        ewlog!(
-            "  {:<width$}  {} of {} LabVIEW files, e.g. {}",
-            format!("{} {}", s.name, s.version),
-            s.found,
-            s.total,
-            at.display()
-        );
+        log::debug!("  {}: {} of {} LabVIEW files also in {lv}, e.g. {}", s.name, s.found, s.total, at.display());
     }
     let lvpm: Vec<&Shadowed> = shadowed.iter().filter(|s| matches!(s.global, Global::Lvpm(_))).collect();
-    let other = shadowed.len() - lvpm.len();
-    if other > 0 {
-        let which = match lvpm.is_empty() {
-            true => "them",
-            false => "the others",
-        };
+    if lvpm.len() < shadowed.len() {
+        let which = if lvpm.is_empty() { "them" } else { "the others" };
         ewlog!("  fix: uninstall {which} from {lv} with the tool that installed them (VIPM)");
     }
     for s in lvpm {
-        let had = match &s.global {
-            Global::Lvpm(Some(version)) => format!(" (lvpm installed {version} there)"),
-            _ => String::new(),
-        };
-        ewlog!(
-            "  fix: `lvpm uninstall {} --global --labview-version {}`{had}",
-            s.name,
-            v.target.year()
-        );
+        ewlog!("  fix: lvpm uninstall {} --global --labview-version {}", s.name, v.target.year());
     }
 }
 
