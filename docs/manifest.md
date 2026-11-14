@@ -388,7 +388,7 @@ the chosen manifest for subsequent installs and dependency-aware uninstalls.
 
 A `.vipc` (VI Package Configuration) is not read as a manifest: `lvpm import`
 writes its packages into an `lvpm.toml` once. See
-[compatability.md](compatability.md#importing-a-vipc).
+[compatibility.md](compatibility.md#importing-a-vipc).
 
 ### One file for both tools
 
