@@ -179,7 +179,7 @@ fn entry_from_vip(path: &Path) -> Result<Entry> {
 fn entry_from_bytes(path: &Path, bytes: &[u8]) -> Result<Entry> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
     let idx = (0..zip.len())
-        .find(|i| zip.by_index(*i).map(|f| f.name().eq_ignore_ascii_case("spec")).unwrap_or(false))
+        .find(|i| zip.by_index(*i).is_ok_and(|f| f.name().is_ok_and(|n| n.eq_ignore_ascii_case("spec"))))
         .context("no `spec` member")?;
     let mut buf = Vec::new();
     std::io::Read::read_to_end(&mut zip.by_index(idx)?, &mut buf)?;

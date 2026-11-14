@@ -2852,7 +2852,7 @@ fn cmd_vi_run(
 fn read_spec(zip: &mut zip::ZipArchive<std::io::Cursor<Vec<u8>>>) -> Result<String> {
     // Almost always literally "spec" at the archive root.
     let idx = (0..zip.len()).find(|i| {
-        zip.by_index(*i).map(|f| f.name().eq_ignore_ascii_case("spec")).unwrap_or(false)
+        zip.by_index(*i).is_ok_and(|f| f.name().is_ok_and(|n| n.eq_ignore_ascii_case("spec")))
     });
     let Some(idx) = idx else {
         bail!("no `spec` member in .vip archive");
