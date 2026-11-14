@@ -198,7 +198,16 @@ pass:
 - An empty selection is an error for a manifest-driven install.
 
 `lvpm install <name>[@<version>]` inside a project installs that one package
-using the project's `[sources]`, but does not add it to the manifest yet.
+using the project's `[sources]`. On a venv it is also written into the
+venv's manifest: `name@version` saves what was given (`name@>=6.0` too),
+a bare name the version installed, exact. An entry that exists keeps its
+group, key spelling, `hooks` and `relink`; only its version changes.
+`--group <g>` saves into `[dependencies.<g>]` (created when missing; `main`
+is `[dependencies]`). `lvpm uninstall <name>` on a venv removes the entry
+from every group declaring it, after the uninstall succeeded; what only that
+package needed may then go too. `--no-save` leaves the manifest alone for
+either command, and `uninstall --all` never edits it. The edit keeps
+comments and formatting (`toml_edit`); a `vipm.toml` is read, never written.
 
 `lvpm install` is additive: it never removes a package that is installed but
 no longer listed. Use `lvpm uninstall <name>`, or `lvpm uninstall --all`
@@ -432,8 +441,9 @@ Tracked in [roadmap.md](roadmap.md#the-manifest-and-the-lockfile---wip):
     the install sequence, to be extracted so `install` and `sync` share them.
   - Proposed scope: venvs and `--prefix` only, refused with `--global`;
     remove extras first, once resolution has succeeded.
-- **`lvpm add` / `lvpm remove`**, editing the manifest while preserving
-  comments and formatting.
+- ~~**`lvpm add` / `lvpm remove`**~~: done the npm way instead, as
+  `install <name>` and `uninstall <name>` editing the manifest on a venv
+  (see [How the manifest resolves](#how-the-manifest-resolves)).
 - **Future constraint grammar (Cargo)**, one for every dependency table:
 
   | Written           | Meaning                                    | Example range                       |
@@ -454,17 +464,17 @@ Tracked in [roadmap.md](roadmap.md#the-manifest-and-the-lockfile---wip):
     say so once, when it reads a bare version that a caret would widen.
   - Python's `==` is not accepted: `=` is the one spelling for exact, and
     `==` fails with a hint to use it.
-  - `name@version` stays a CLI shorthand for exact (`lvpm install`,
-    `lvpm add`), as in `cargo add`; it is not written in the manifest.
-    `lvpm add` writes `=x` when given a version and a caret on the resolved
-    version otherwise, as `cargo add` does.
+  - `name@version` stays a CLI shorthand (`lvpm install`), as in
+    `cargo add`. Once the grammar lands, `install <name>` saves `=x` when
+    given a version and a caret on the resolved version otherwise, as
+    `cargo add` does; today it saves the version as given, else exact.
 - **Dependency groups, remaining** (groups and `--with` / `--without` /
   `--only` are done, see [named dependency groups](#named-dependency-groups)):
   - **Open decision: default groups.** Only `main` installs by default.
     Whether a `dev` group (or a `[project] default-groups` list) should be
     installed by default, as uv does, is undecided. VIPM installs its dev
     dependencies only with `--dev`, which matches today's behaviour.
-  - `lvpm add <pkg> --group <g>` writes into that group's table.
+  - ~~`lvpm add <pkg> --group <g>`~~: done as `install <pkg> --group <g>`.
   - `lvpm.lock` records every group's packages, each tagged with its groups,
     so changing the selection never re-resolves. `lvpm sync` uninstalls
     packages that only unselected groups need.

@@ -153,9 +153,10 @@ Reference and `vipm.toml` comparison: [manifest.md](manifest.md).
   lock because today's resolver does not follow already-installed
   dependencies, so it cannot say what is still needed; notes in
   [manifest.md](manifest.md#to-do).
-- **`lvpm add <pkg>[@constraint]` / `lvpm remove <pkg>`** — edit the manifest
-  and install/uninstall in one step (the `toml` crate can write; the lockfile
-  wants this too).
+- **Editing the manifest from the CLI** — done the npm way: on a venv,
+  `lvpm install <pkg>` saves the package to `lvpm.toml` (`--group <g>`),
+  `lvpm uninstall <pkg>` removes it, `--no-save` opts out; comments and
+  formatting are kept (`toml_edit`). No separate `add` / `remove`.
 - **Constraint grammar (Cargo)** — bare and `^` caret, `~` tilde, `=`
   exact, `>=` floor, `*` newest, in every dependency table; `name@x` stays
   CLI-only. Breaking: a bare version is exact today. `vipm.toml` bare

@@ -461,6 +461,182 @@ fn string_array(label: &str, key: &str, value: toml::Value) -> Result<Vec<String
         .collect()
 }
 
+// ------------------------------------------------------------- editing ----
+//
+// `lvpm install <pkg>` and `lvpm uninstall <pkg>` on a venv keep its
+// manifest in step. The edit goes through `toml_edit`, so comments,
+// ordering and formatting outside the one entry stay as written.
+
+/// What [`save_dependency`] did.
+#[derive(Debug, PartialEq)]
+pub enum Saved {
+    /// A new entry, in the group named.
+    Added { group: String },
+    /// An existing entry's version changed from `from`.
+    Updated { group: String, from: String },
+    /// The entry already said this version.
+    Unchanged { group: String },
+}
+
+/// Write `name = "version"` into `path`'s `group` (`main` is `[dependencies]`),
+/// or with no group into the one already declaring `name`, else
+/// `[dependencies]`. An existing entry keeps its key spelling and, as a
+/// table, its `hooks` and `relink`; only its version changes. A missing group
+/// table is created.
+pub fn save_dependency(path: &Path, group: Option<&str>, name: &str, version: &str) -> Result<Saved> {
+    let mut edit = Edit::open(path)?;
+    let declared = edit.declared_in(name);
+    let group = match group {
+        Some(g) => g.to_string(),
+        None => declared.first().map(|(g, _)| g.clone()).unwrap_or_else(|| MAIN_GROUP.to_string()),
+    };
+    if group != MAIN_GROUP && !edit.groups().contains(&group) && edit.is_entry(&group) {
+        bail!("{} declares a package named {group:?}; it cannot also be a group", path.display());
+    }
+    let table = edit.group_table(&group)?;
+    let key = table.iter().map(|(k, _)| k.to_string()).find(|k| k.eq_ignore_ascii_case(name));
+    let saved = match key {
+        Some(key) => {
+            let item = table.get_mut(&key).expect("key was just found");
+            let from = match item.as_table_like_mut() {
+                Some(t) => {
+                    let from = t.get("version").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    t.insert("version", toml_edit::value(version));
+                    from
+                }
+                None => {
+                    let from = item.as_str().unwrap_or_default().to_string();
+                    let decor = item.as_value().map(|v| v.decor().clone());
+                    *item = toml_edit::value(version);
+                    if let (Some(decor), Some(v)) = (decor, item.as_value_mut()) {
+                        *v.decor_mut() = decor;
+                    }
+                    from
+                }
+            };
+            match from == version {
+                true => Saved::Unchanged { group },
+                false => Saved::Updated { group, from },
+            }
+        }
+        None => {
+            table.insert(name, toml_edit::value(version));
+            Saved::Added { group }
+        }
+    };
+    edit.write()?;
+    Ok(saved)
+}
+
+/// Remove `name` from every group of `path` that declares it, and return
+/// those groups (`main` for `[dependencies]`). Nothing declaring it leaves
+/// the file untouched.
+pub fn remove_dependency(path: &Path, name: &str) -> Result<Vec<String>> {
+    let mut edit = Edit::open(path)?;
+    let declared = edit.declared_in(name);
+    if declared.is_empty() {
+        return Ok(declared.into_iter().map(|(g, _)| g).collect());
+    }
+    for (group, key) in &declared {
+        edit.group_table(group)?.remove(key);
+    }
+    edit.write()?;
+    Ok(declared.into_iter().map(|(g, _)| g).collect())
+}
+
+/// A manifest open for editing.
+struct Edit {
+    path: PathBuf,
+    doc: toml_edit::DocumentMut,
+    crlf: bool,
+}
+
+impl Edit {
+    fn open(path: &Path) -> Result<Edit> {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading manifest {}", path.display()))?;
+        let doc = text.parse().with_context(|| format!("parsing manifest {}", path.display()))?;
+        Ok(Edit { path: path.to_path_buf(), doc, crlf: text.contains("\r\n") })
+    }
+
+    fn dependencies(&self) -> Option<&dyn toml_edit::TableLike> {
+        self.doc.get("dependencies").and_then(|d| d.as_table_like())
+    }
+
+    /// The group tables under `[dependencies]`, in file order.
+    fn groups(&self) -> Vec<String> {
+        self.dependencies()
+            .map(|d| d.iter().filter(|(_, v)| is_group_item(v)).map(|(k, _)| k.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether `[dependencies]` has an entry (not a group) under `key`.
+    fn is_entry(&self, key: &str) -> bool {
+        self.dependencies().and_then(|d| d.get(key)).is_some_and(|v| !is_group_item(v))
+    }
+
+    /// Every group declaring `name`, with the key as spelled there.
+    fn declared_in(&self, name: &str) -> Vec<(String, String)> {
+        let Some(deps) = self.dependencies() else { return Vec::new() };
+        let mut found = Vec::new();
+        let mut look = |group: &str, table: &dyn toml_edit::TableLike| {
+            for (k, v) in table.iter() {
+                if k.eq_ignore_ascii_case(name) && k != INCLUDE_KEY && !is_group_item(v) {
+                    found.push((group.to_string(), k.to_string()));
+                }
+            }
+        };
+        look(MAIN_GROUP, deps);
+        for (g, v) in deps.iter() {
+            if is_group_item(v)
+                && let Some(t) = v.as_table_like()
+            {
+                look(g, t);
+            }
+        }
+        found
+    }
+
+    /// The table holding `group`'s entries, created when missing.
+    fn group_table(&mut self, group: &str) -> Result<&mut dyn toml_edit::TableLike> {
+        let path = self.path.display().to_string();
+        let root = self.doc.as_table_mut();
+        if !root.contains_key("dependencies") {
+            root.insert("dependencies", toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        let deps = root["dependencies"]
+            .as_table_like_mut()
+            .with_context(|| format!("{path}: dependencies is not a table"))?;
+        if group == MAIN_GROUP {
+            return Ok(deps);
+        }
+        if deps.get(group).is_none() {
+            deps.insert(group, toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        deps.get_mut(group)
+            .and_then(|g| g.as_table_like_mut())
+            .with_context(|| format!("{path}: dependencies.{group} is not a table"))
+    }
+
+    /// Write the file back, in its own line endings, once it still reads as
+    /// a manifest.
+    fn write(&self) -> Result<()> {
+        let mut text = self.doc.to_string();
+        if self.crlf {
+            text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+        }
+        parse(&text).with_context(|| format!("the edited {} would not read back", self.path.display()))?;
+        std::fs::write(&self.path, text).with_context(|| format!("writing manifest {}", self.path.display()))
+    }
+}
+
+/// A table under `[dependencies]` that is a group rather than one dependency
+/// (see [`is_dependency_table`]).
+fn is_group_item(item: &toml_edit::Item) -> bool {
+    item.as_table_like().is_some_and(|t| {
+        !(t.contains_key("version") && t.iter().all(|(k, _)| DEPENDENCY_KEYS.contains(&k)))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,5 +990,87 @@ pkg_a = "*"
 
         let err = p.select(&strings(&["Test"]), &none, &none).unwrap_err().to_string();
         assert!(err.contains("\"Test\""), "group names are case-sensitive: {err}");
+    }
+
+    fn edited(before: &str, f: impl FnOnce(&Path) -> Result<()>) -> String {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("lvpm-edit-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        std::fs::write(&path, before).unwrap();
+        f(&path).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        after
+    }
+
+    const MANIFEST: &str = "# my project\n[project]\nname = \"demo\"\n\n[dependencies]\n\
+        oglib_error = \"6.0.1\"  # pinned for a reason\n\
+        caraya = { version = \"1.0\", hooks = \"run\" }\n\n\
+        [dependencies.test]\nvi_tester = \"*\"\n";
+
+    #[test]
+    fn saving_adds_updates_and_keeps_everything_else() {
+        let after = edited(MANIFEST, |p| {
+            assert_eq!(save_dependency(p, None, "new_pkg", "2.0")?, Saved::Added { group: "main".into() });
+            assert_eq!(
+                save_dependency(p, None, "OGLIB_ERROR", "6.1")?,
+                Saved::Updated { group: "main".into(), from: "6.0.1".into() }
+            );
+            assert_eq!(
+                save_dependency(p, None, "caraya", "1.1")?,
+                Saved::Updated { group: "main".into(), from: "1.0".into() }
+            );
+            assert_eq!(save_dependency(p, None, "vi_tester", "*")?, Saved::Unchanged { group: "test".into() });
+            Ok(())
+        });
+        assert!(after.starts_with("# my project\n"), "{after}");
+        assert!(after.contains("oglib_error = \"6.1\"  # pinned for a reason\n"), "{after}");
+        assert!(after.contains("caraya = { version = \"1.1\", hooks = \"run\" }"), "{after}");
+        assert!(after.contains("new_pkg = \"2.0\""), "{after}");
+        let p = parse(&after).unwrap();
+        assert!(p.dependencies.iter().any(|(n, _)| n == "new_pkg"));
+        assert_eq!(p.hooks, vec![("caraya".to_string(), Hooks::Run)]);
+    }
+
+    #[test]
+    fn saving_into_a_group_creates_it_when_missing() {
+        let after = edited(MANIFEST, |p| {
+            save_dependency(p, Some("dev"), "lint", "1.0")?;
+            save_dependency(p, Some("test"), "mock", "*")?;
+            Ok(())
+        });
+        let p = parse(&after).unwrap();
+        let group = |name: &str| &p.groups.iter().find(|(n, _)| n == name).unwrap().1.dependencies;
+        assert_eq!(group("dev")[0].0, "lint");
+        assert!(group("test").iter().any(|(n, _)| n == "mock"));
+        assert!(after.contains("[dependencies.dev]"), "{after}");
+    }
+
+    #[test]
+    fn saving_into_a_manifest_without_dependencies() {
+        let after = edited("[project]\nname = \"empty\"\n", |p| save_dependency(p, None, "x", "1").map(drop));
+        assert_eq!(parse(&after).unwrap().dependencies[0].0, "x");
+    }
+
+    #[test]
+    fn removing_takes_the_entry_out_of_every_group() {
+        let both = format!("{MANIFEST}caraya = \"*\"\n");
+        let after = edited(&both, |p| {
+            assert_eq!(remove_dependency(p, "Caraya")?, ["main", "test"]);
+            assert!(remove_dependency(p, "not_there")?.is_empty());
+            Ok(())
+        });
+        assert!(!after.to_lowercase().contains("caraya"), "{after}");
+        assert!(after.contains("oglib_error = \"6.0.1\"  # pinned for a reason"), "{after}");
+        assert!(after.contains("vi_tester"), "{after}");
+    }
+
+    #[test]
+    fn crlf_manifests_stay_crlf() {
+        let crlf = MANIFEST.replace('\n', "\r\n");
+        let after = edited(&crlf, |p| save_dependency(p, Some("dev"), "lint", "1.0").map(drop));
+        assert!(!after.replace("\r\n", "").contains('\n'), "{after:?}");
     }
 }

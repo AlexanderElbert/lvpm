@@ -244,9 +244,17 @@ created C:\Git\MyProject\.lv-venv
   VI Server port 3735
 
 $ lvpm install                    # everything lvpm.toml lists, into .lv-venv
-$ lvpm install oglib_error        # one more package, into .lv-venv
+$ lvpm install oglib_error        # one more package, into .lv-venv and lvpm.toml
 $ lvpm launch MyProject.lvproj    # a LabVIEW that sees the venv
 ```
+
+On a venv, `lvpm install <name>` also writes the package into `lvpm.toml`:
+the version given with `name@version`, else the one installed. An entry
+that exists is updated in place, in its group; `--group dev` saves into
+`[dependencies.dev]` instead. `lvpm uninstall <name>` takes the package out
+of every group declaring it. Comments and formatting elsewhere in the file
+stay as written. `--no-save` leaves the manifest alone for either command,
+`uninstall --all` never edits it, and a `vipm.toml` is never written.
 
 - `lvpm venv create` makes `.lv-venv/` beside `lvpm.toml` by default and binds it to a
   LabVIEW version: `--labview-version`, else the manifest's `labview`.
@@ -354,8 +362,9 @@ named package. If it has installed dependencies that are not needed by other
 packages, lvpm asks whether to remove them too. Shared dependencies (and
 dependencies they need) are kept and reported. In a venv, packages declared
 in any group of its bound project manifest, and their transitive dependencies,
-are also kept. Explicitly uninstalling a declared package warns but proceeds;
-uninstall never edits the manifest.
+are also kept. Uninstalling a declared package by name also removes it from
+the manifest, so what only it needed can go with it; with `--no-save` it
+stays declared, and lvpm warns.
 
 For scripts, pass `--with-deps` to remove unshared dependencies or
 `--keep-deps` to keep them without prompting. Without either option, an
@@ -681,9 +690,7 @@ runs.
   that drops palette files into the overlay is picked up at the next
   `lvpm launch`, not by a refresh. Uninstall hooks still never run in a venv,
   whose LabVIEW has to be closed before its files can be removed.
-  `lvpm install <name>` in a venv does not
-  add the pin to `lvpm.toml`. No warning yet when a global copy of a venv
-  package shadows it.
+  No warning yet when a global copy of a venv package shadows it.
 
 [docs/roadmap.md](docs/roadmap.md) has what is planned.
 

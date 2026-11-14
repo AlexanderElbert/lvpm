@@ -32,7 +32,8 @@ lvpm [--labview-version YYYY] [--prefix DIR | --project DIR] [--global] [--refre
   install [<pkg>[@ver]] [--manifest FILE] [--dry-run] [--no-deps]
           [--no-linkfix] [--relink] [--no-hooks | --hooks] [--allow-downgrade]
           [--relink-timeout SECS] [--relink-progress NAME] [--keep-open]
-  uninstall <pkg> | --all
+          [--no-save | --group G]
+  uninstall <pkg> [--no-save] | --all     [--with-deps | --keep-deps]
   relink <pkg> | --all          [--relink-timeout] [--relink-progress] [--keep-open]
   linkfix [--tree DIR] [--dry-run] [--verbose] [--keep-compiled-code]
      [--fix owner,paths,qualifiers,source-only] [--report FILE]
@@ -223,7 +224,6 @@ Proposed:
 | Command | What | Where it is planned |
 |---|---|---|
 | `init` | write an `lvpm.toml` for the project here (name, `labview` from `--labview-version` or the newest target) | new |
-| `add <pkg>[@constraint]` / `remove <pkg>` | edit `lvpm.toml` and install or uninstall in one step | roadmap, manifest |
 | `update [<pkg>]` | re-resolve and rewrite `lvpm.lock` | roadmap, lockfile |
 | `outdated` | installed versions against the newest the constraints allow | new; needs the lockfile |
 | `info <pkg>` | versions, dependencies, source, license, description before installing | new; the TUI's Browse details need the same |
@@ -237,16 +237,12 @@ Proposed:
 
 ## Open decisions
 
-1. **What `install <pkg>` does inside a project once `add` exists.** npm's
-   answer: `install <pkg>` adds to the manifest. cargo's: only `add` edits
-   the manifest, `install` is for tools. Today `install <pkg>` in a venv
-   installs without touching `lvpm.toml`, so the venv holds something the
-   manifest does not declare and the lockfile could not reproduce.
-   Recommendation: inside a project, `install <pkg>` refuses and points to
-   `add`; outside a project it installs as today.
-2. **Names for `add` / `remove`.** `remove` next to `uninstall` is
-   confusing. Alternative: `add` / `drop`, or keep `uninstall` for both and
-   have it edit the manifest inside a project.
+1. ~~**What `install <pkg>` does inside a project.**~~ Decided, the npm
+   way: on a venv, `install <pkg>` saves the package to `lvpm.toml`
+   (`--group <g>` picks the group) and `uninstall <pkg>` removes it;
+   `--no-save` opts out. Outside a venv both work as before.
+2. ~~**Names for `add` / `remove`.**~~ Not needed: `install` and
+   `uninstall` edit the manifest themselves.
 3. **`start` and `launch`** (item 5): one command, or two with a clear
    split.
 4. **Short flags.** Today only `-y`. Candidates: `-n` for `--dry-run`, `-q`,
@@ -259,6 +255,6 @@ Proposed:
 2. Items 1 to 9 and 13: names, flags, aliases. One pull request per item or
    per pair; the README's command table changes with each.
 3. Items 10 to 12 with the event layer (refactor steps 4 and 5).
-4. Missing commands, lockfile first, after decision 1.
+4. Missing commands, lockfile first.
 5. Release the frozen interface as 1.0, or as 0.x with this file as the
    promise.
