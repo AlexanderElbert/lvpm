@@ -34,6 +34,7 @@ mod project;
 mod refresh;
 mod relink;
 mod resolve;
+mod shadow;
 mod spec;
 mod target;
 mod venv;
@@ -1787,6 +1788,15 @@ fn cmd_install(
             None => {}
         }
     }
+    // What this install put in the venv that the LabVIEW installation has a
+    // copy of too: that copy is the one LabVIEW would load.
+    if let Some(v) = &venv
+        && !dry_run
+    {
+        let records: Vec<install::Manifest> =
+            plan.iter().filter_map(|e| install::read_manifest(&store, &e.name).ok()).collect();
+        shadow::warn(v, &shadow::find(v, &records));
+    }
     if total_writes > 0 && !dry_run && venv.is_some() {
         log!("\nnext: `lvpm launch` starts LabVIEW on this venv — a LabVIEW already open on it");
         log!("      has to be restarted to see what was just installed");
@@ -2208,6 +2218,12 @@ fn cmd_venv(cli: &Cli, sub: &VenvCmd) -> Result<()> {
                     }
                 );
                 log!("  log            {}", v.log_path().display());
+                let shadowed = shadow::find(&v, &installed);
+                match shadowed.is_empty() {
+                    true => log!("  shadowed       none: LabVIEW has no copy of its own of any of them"),
+                    false => log!("  shadowed       {} also in {} (below)", shadowed.len(), v.target.label()),
+                }
+                shadow::warn(&v, &shadowed);
                 Ok(())
             }
             None => {
@@ -2313,6 +2329,10 @@ fn cmd_launch(cli: &Cli, lvproj: Option<&Path>, ini_keys: &[String], no_check: b
     if !no_check {
         check_venv_for_launch(&dest, &v)?;
     }
+    // Not a reason to refuse: the copies may be the same version. But the
+    // user should know which one LabVIEW is about to load.
+    let records = install::list_installed(&v.store()).unwrap_or_default();
+    shadow::warn(&v, &shadow::find(&v, &records));
     let extra = ini_keys
         .iter()
         .map(|kv| {

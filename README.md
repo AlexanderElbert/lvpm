@@ -354,6 +354,10 @@ Two things follow from LabVIEW reading an addon's contents at launch:
 - The real installation always wins over the overlay: a package installed
   both globally and in the venv loads from the global copy, whatever its
   version. Keep the target installation clean of what the venv provides.
+  lvpm warns when it is not: after an install into the venv, at `lvpm launch`
+  and in `lvpm venv status`, it names every venv package whose LabVIEW files
+  the installation has too (from VIPM, `lvpm install --global` or a copy by
+  hand) and how to remove that copy. The check takes milliseconds.
 
 ### Uninstalling dependencies
 
@@ -690,7 +694,6 @@ runs.
   that drops palette files into the overlay is picked up at the next
   `lvpm launch`, not by a refresh. Uninstall hooks still never run in a venv,
   whose LabVIEW has to be closed before its files can be removed.
-  No warning yet when a global copy of a venv package shadows it.
 
 [docs/roadmap.md](docs/roadmap.md) has what is planned.
 

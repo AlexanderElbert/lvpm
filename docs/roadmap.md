@@ -115,9 +115,11 @@ wins over the overlay; `LVAddons.AdditionalLocations` needs LabVIEW 2024 Q1.
 - **Survive one bad download.** A single failed download aborts the plan;
   retry transient errors, continue past a package, fail at the end with the
   list — as `uninstall --all` already does.
-- **Shadowing warning.** A package installed both globally and in the venv is
-  loaded from the global copy whatever its version. Warn at install and at
-  launch, with both versions and the uninstall command that fixes it.
+- ~~**Shadowing warning.**~~ Done (`src/shadow.rs`): after an install into a
+  venv, at launch and in `venv status`, lvpm names each venv package whose
+  LabVIEW files the installation has too, and the fix (`lvpm uninstall
+  --global` when lvpm put it there, else the tool that did). Found by file,
+  so VIPM installs count. Open: the version of a copy lvpm did not install.
 - **Detect changed package files at launch.** `lvpm launch` checks the
   install records against the manifest (installed, version, files present,
   relink and PostInstall state), but a record holds no hashes, so a package
