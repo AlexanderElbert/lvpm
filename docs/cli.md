@@ -44,7 +44,7 @@ lvpm [--labview-version YYYY] [--prefix DIR | --project DIR] [--global] [--refre
   venv create | status | remove [-y]
   config get <key> | set <key> [<value>...]
   cache add <path>
-  import <file.vipc>            [--all] [--group G] [--dry-run]
+  import <vipm.toml | file.vipc> [--all] [--group G] [--dry-run]
   app-probe <id>...             } VI Server primitives,
   vi-probe <vi>                 } for diagnosis
   vi-save <vi>                  }

@@ -376,13 +376,15 @@ enum Cmd {
         #[arg(long, value_name = "32|64")]
         bitness: Option<u8>,
     },
-    /// Write a VIPM package configuration (.vipc) into the project's lvpm.toml:
-    /// its top-level packages as exact versions, its LabVIEW as `labview`, and
-    /// the packages it carries into the package cache. Installs nothing.
+    /// Write a VIPM file into the project's lvpm.toml, once: a vipm.toml, or a
+    /// package configuration (.vipc), whose top-level packages are written as
+    /// exact versions and whose carried packages go into the package cache.
+    /// Installs nothing.
     Import {
-        /// The .vipc file.
+        /// The vipm.toml or .vipc file.
         file: PathBuf,
-        /// Pin every package in the file, not only those nothing else in it requires.
+        /// For a .vipc: pin every package in the file, not only those nothing
+        /// else in it requires.
         #[arg(long)]
         all: bool,
         /// The dependency group to write into (`main` is [dependencies]).
@@ -404,9 +406,9 @@ enum VenvCmd {
     /// Create `.lv-venv/` for the project here by default and bind it to a LabVIEW:
     /// `--labview-version`, else the manifest's `labview`.
     Create {
-        /// Use this manifest (an `lvpm.toml` or a `vipm.toml`) instead of
-        /// looking for an `lvpm.toml`; the venv goes beside it and no
-        /// skeleton is written.
+        /// Use this manifest (in lvpm.toml's format, under any name) instead
+        /// of looking for an `lvpm.toml`; the venv goes beside it and no
+        /// skeleton is written. A `vipm.toml` comes in with `lvpm import`.
         #[arg(long, value_name = "FILE")]
         manifest: Option<PathBuf>,
     },
@@ -826,25 +828,15 @@ fn group_label(group: &str) -> String {
     }
 }
 
-/// The venv's manifest, when lvpm may edit it: a `vipm.toml` is VIPM's, and
-/// is read but never written.
-fn editable_manifest(v: &venv::Venv) -> Result<Option<PathBuf>> {
-    let path = v.manifest_path().context("venv has no bound manifest")?;
-    if vipm_interop::is_toml(&path) {
-        log!(
-            "\nnote: {} is a VIPM manifest; lvpm does not edit it",
-            path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
-        );
-        return Ok(None);
-    }
-    Ok(Some(path))
+/// The venv's manifest, which `install <pkg>` and `uninstall <pkg>` edit.
+fn editable_manifest(v: &venv::Venv) -> Result<PathBuf> {
+    v.manifest_path().context("venv has no bound manifest")
 }
 
 /// Write a package installed by name into the venv's manifest. A failure is
 /// reported, not raised: the package is installed either way.
 fn save_to_manifest(v: &venv::Venv, group: Option<&str>, name: &str, version: &str, dry_run: bool) {
     let saved = editable_manifest(v).and_then(|path| {
-        let Some(path) = path else { return Ok(()) };
         let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if dry_run {
             let into = group.map(group_label).unwrap_or_else(|| "its group".to_string());
@@ -869,10 +861,25 @@ fn save_to_manifest(v: &venv::Venv, group: Option<&str>, name: &str, version: &s
     }
 }
 
+/// Where `lvpm import` writes, and how.
+struct ImportTarget {
+    /// The `lvpm.toml` written.
+    manifest: PathBuf,
+    /// Whether it existed before the import.
+    exists: bool,
+    dry_run: bool,
+}
+
+impl ImportTarget {
+    fn would(&self) -> &'static str {
+        if self.dry_run { "would " } else { "" }
+    }
+}
+
 /// The manifest `lvpm import` writes: the venv's when one is in effect, else
-/// `--project`'s or the nearest `lvpm.toml`, else a new one in `--project` or
-/// the working directory. The flag says whether it exists yet.
-fn import_manifest(cli: &Cli) -> Result<(PathBuf, bool)> {
+/// `--project`'s or the nearest `lvpm.toml`, else a new one in the working
+/// directory.
+fn import_target(cli: &Cli, dry_run: bool) -> Result<ImportTarget> {
     let cwd = std::env::current_dir()?;
     let path = match venv::project_manifest(cli.project.as_deref(), &cwd)? {
         Some(p) => p,
@@ -880,43 +887,175 @@ fn import_manifest(cli: &Cli) -> Result<(PathBuf, bool)> {
     };
     ensure!(
         !vipm_interop::is_toml(&path),
-        "this project's venv reads {}, which lvpm does not write; import into an {} instead",
-        path.display(),
-        project::FILE_NAME
+        "this project's venv was created from {}, which lvpm no longer reads\n\
+         hint: `lvpm venv remove`, then the import, then `lvpm venv create`",
+        path.display()
     );
     let exists = path.is_file();
-    Ok((path, exists))
+    Ok(ImportTarget { manifest: path, exists, dry_run })
 }
 
-/// `lvpm import <file.vipc>`: the packages a project would list by hand
-/// (those nothing else in the file requires; every package with `--all`)
-/// into the manifest as exact versions, the target as `labview` when the
-/// manifest has none, and the packages carried in the file into the cache.
-/// Ends by naming the packages that only the local cache has, since a
-/// teammate or CI runner will not have them.
+/// Name the manifest, write a skeleton when there is none, and set the
+/// `[project]` keys the imported file gives where the manifest has none.
+fn import_open(t: &ImportTarget, project_keys: &[(&str, Option<&str>)]) -> Result<()> {
+    log!("\nmanifest: {}{}", t.manifest.display(), if t.exists { "" } else { " (new)" });
+    let given = |key: &str| project_keys.iter().find(|(k, _)| *k == key).and_then(|(_, v)| *v);
+    if !t.exists && !t.dry_run {
+        let dir_name = t
+            .manifest
+            .parent()
+            .and_then(|d| d.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "project".to_string());
+        let name = given("name").map(str::to_string).unwrap_or(dir_name);
+        std::fs::write(&t.manifest, project::skeleton(&name, given("labview")))
+            .with_context(|| format!("writing {}", t.manifest.display()))?;
+    }
+    let current = match t.exists {
+        true => Some(project::read(&t.manifest)?),
+        false => None,
+    };
+    for (key, value) in project_keys {
+        let Some(value) = value else { continue };
+        let have = current.as_ref().and_then(|p| match *key {
+            "name" => p.name.clone(),
+            "version" => p.version.clone(),
+            "labview" => p.labview.clone(),
+            _ => None,
+        });
+        match have {
+            Some(have) if have != *value => log!("  {key} = {have:?} kept (the file says {value:?})"),
+            Some(_) => {}
+            None if !t.exists && *key != "version" => log!("  {}set {key} = {value:?}", t.would()),
+            None => {
+                if !t.dry_run {
+                    project::set_project_if_missing(&t.manifest, key, value)?;
+                }
+                log!("  {}set {key} = {value:?}", t.would());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write one imported package as an exact version, and say what happened.
+fn import_save(t: &ImportTarget, group: Option<&str>, name: &str, version: &str) -> Result<()> {
+    if t.dry_run {
+        let into = match (group, t.exists) {
+            (Some(g), _) => group_label(g),
+            (None, true) => "the group declaring it, else [dependencies]".to_string(),
+            (None, false) => group_label(project::MAIN_GROUP),
+        };
+        log!("  would save {name} = \"{version}\" ({into})");
+        return Ok(());
+    }
+    match project::save_dependency(&t.manifest, group, name, version)? {
+        project::Saved::Added { group } => log!("  saved {name} = \"{version}\" {}", group_label(&group)),
+        project::Saved::Updated { group, from } => {
+            log!("  updated {name} {}: \"{from}\" -> \"{version}\"", group_label(&group))
+        }
+        project::Saved::Unchanged { group } => log!("  {name} = \"{version}\" already in {}", group_label(&group)),
+    }
+    Ok(())
+}
+
+/// Close with what to do next.
+fn import_finish(t: &ImportTarget) -> Result<()> {
+    match t.dry_run {
+        true => log!("\ndry run: nothing written"),
+        false => log!("\nnext: `lvpm install` installs them"),
+    }
+    Ok(())
+}
+
+/// `lvpm import <file>`: a VIPM file written into the project's `lvpm.toml`
+/// once. lvpm reads `lvpm.toml` only; this is how VIPM's files come in.
 fn cmd_import(cli: &Cli, file: &Path, all: bool, group: Option<&str>, dry_run: bool) -> Result<()> {
-    ensure!(
-        vipm_interop::is_vipc(file),
-        "lvpm import reads a VIPM package configuration (.vipc); got {}\n\
-         hint: a vipm.toml is used as it is: `lvpm install --manifest vipm.toml`",
-        file.display()
-    );
     if let Some(g) = group {
         ensure!(!g.trim().is_empty(), "--group needs a name (`main` is [dependencies])");
     }
     let file = std::path::absolute(file)?;
+    if vipm_interop::is_toml(&file) {
+        ensure!(!all, "--all is for a .vipc; a vipm.toml lists only what the project declares");
+        return import_vipm_toml(cli, &file, group, dry_run);
+    }
+    ensure!(
+        vipm_interop::is_vipc(&file),
+        "lvpm import reads VIPM's vipm.toml or a .vipc package configuration; got {}",
+        file.display()
+    );
+    import_vipc(cli, &file, all, group, dry_run)
+}
+
+/// A `vipm.toml`: `[dependencies]` as exact versions (into `--group` when
+/// given), `[dev-dependencies]` into `[dependencies.dev]`,
+/// `[nipm.dependencies]` as written, and `[project]` name, version and
+/// `labview-version` (as the minimum `labview`) where the manifest has none.
+fn import_vipm_toml(cli: &Cli, file: &Path, group: Option<&str>, dry_run: bool) -> Result<()> {
+    let c = vipm_interop::read_toml(file)?;
+    let t = import_target(cli, dry_run)?;
+    log!("import: {} (VIPM manifest)", file.display());
+    if let Some(lv) = &c.project.labview {
+        log!("  labview-version {lv:?} read as minimum labview = {lv:?}");
+    }
+    if !c.unused.is_empty() {
+        log!("  not used: {}", c.unused.join(", "));
+    }
+    import_open(
+        &t,
+        &[
+            ("name", c.project.name.as_deref()),
+            ("version", c.project.version.as_deref()),
+            ("labview", c.project.labview.as_deref()),
+        ],
+    )?;
+    for (name, constraint) in &c.project.dependencies {
+        let project::Constraint::Exact(v) = constraint else { unreachable!("vipm.toml versions are exact") };
+        import_save(&t, group, name, &v.raw)?;
+    }
+    for (gname, g) in &c.project.groups {
+        for (name, constraint) in &g.dependencies {
+            let project::Constraint::Exact(v) = constraint else { unreachable!("vipm.toml versions are exact") };
+            import_save(&t, Some(gname), name, &v.raw)?;
+        }
+    }
+    if c.project.groups.iter().any(|(n, _)| n == vipm_interop::DEV_GROUP) {
+        log!("  [dev-dependencies] are the group {0:?}: `lvpm install --with {0}`", vipm_interop::DEV_GROUP);
+    }
+    for (name, value) in &c.nipm {
+        let changed = match dry_run {
+            true => true,
+            false => project::save_nipm(&t.manifest, name, value)?,
+        };
+        match changed {
+            true if dry_run => log!("  would save {name} = {value} [nipm.dependencies]"),
+            true => log!("  saved {name} = {value} [nipm.dependencies]"),
+            false => log!("  {name} = {value} already in [nipm.dependencies]"),
+        }
+    }
+    if c.project.dependencies.is_empty() && c.project.groups.is_empty() && c.nipm.is_empty() {
+        log!("\n{} lists no packages", file.display());
+    }
+    import_finish(&t)
+}
+
+/// A `.vipc`: the packages a project would list by hand (those nothing else
+/// in the file requires; every package with `--all`) as exact versions, the
+/// target as `labview` when the manifest has none, and the packages carried
+/// in the file into the cache. Ends by naming the packages that only the
+/// local cache has, since a teammate or CI runner will not have them.
+fn import_vipc(cli: &Cli, file: &Path, all: bool, group: Option<&str>, dry_run: bool) -> Result<()> {
     let file_name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let vipc = vipm_interop::read_vipc(&file)?;
-    let (manifest, exists) = import_manifest(cli)?;
-    let would = if dry_run { "would " } else { "" };
+    let vipc = vipm_interop::read_vipc(file)?;
+    let t = import_target(cli, dry_run)?;
 
     log!("import: {} (VIPM package configuration)", file.display());
     match (&vipc.target, &vipc.labview) {
-        (Some(t), Some(lv)) => log!("  target LabVIEW {t}, read as minimum labview = {lv:?}"),
-        (Some(t), None) => log!("  target LabVIEW {t}, older than lvpm can name by year; labview not set"),
+        (Some(tg), Some(lv)) => log!("  target LabVIEW {tg}, read as minimum labview = {lv:?}"),
+        (Some(tg), None) => log!("  target LabVIEW {tg}, older than lvpm can name by year; labview not set"),
         (None, _) => log!("  no LabVIEW target"),
     }
-    if vipc.target.as_deref().is_some_and(|t| t.contains("-bit")) {
+    if vipc.target.as_deref().is_some_and(|tg| tg.contains("-bit")) {
         log!("  bitness not used: lvpm takes it from the LabVIEW the venv is bound to");
     }
     for spec in &vipc.unreadable_specs {
@@ -937,51 +1076,10 @@ fn cmd_import(cli: &Cli, file: &Path, all: bool, group: Option<&str>, dry_run: b
         vipc.packages.len() - roots.len()
     );
 
-    log!("\nmanifest: {}{}", manifest.display(), if exists { "" } else { " (new)" });
-    if !exists && !dry_run {
-        let name = manifest
-            .parent()
-            .and_then(|d| d.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "project".to_string());
-        std::fs::write(&manifest, project::skeleton(&name, vipc.labview.as_deref()))
-            .with_context(|| format!("writing {}", manifest.display()))?;
-    }
-    if let Some(lv) = &vipc.labview {
-        match exists {
-            false => log!("  {would}set labview = {lv:?}"),
-            true if dry_run => match project::read(&manifest)?.labview {
-                Some(have) => log!("  labview = {have:?} kept (the file says {lv:?})"),
-                None => log!("  would set labview = {lv:?}"),
-            },
-            true => match project::set_labview_if_missing(&manifest, lv)? {
-                Some(have) if &have != lv => log!("  labview = {have:?} kept (the file says {lv:?})"),
-                Some(_) => {}
-                None => log!("  set labview = {lv:?}"),
-            },
-        }
-    }
-
+    import_open(&t, &[("labview", vipc.labview.as_deref())])?;
     for &i in &pinned {
         let p = &vipc.packages[i];
-        if dry_run {
-            let into = match (group, exists) {
-                (Some(g), _) => group_label(g),
-                (None, true) => "the group declaring it, else [dependencies]".to_string(),
-                (None, false) => group_label(project::MAIN_GROUP),
-            };
-            log!("  would save {} = \"{}\" ({into})", p.name, p.version);
-            continue;
-        }
-        match project::save_dependency(&manifest, group, &p.name, &p.version)? {
-            project::Saved::Added { group } => log!("  saved {} = \"{}\" {}", p.name, p.version, group_label(&group)),
-            project::Saved::Updated { group, from } => {
-                log!("  updated {} {}: \"{from}\" -> \"{}\"", p.name, group_label(&group), p.version)
-            }
-            project::Saved::Unchanged { group } => {
-                log!("  {} = \"{}\" already in {}", p.name, p.version, group_label(&group))
-            }
-        }
+        import_save(&t, group, &p.name, &p.version)?;
     }
     let left: Vec<usize> = (0..vipc.packages.len()).filter(|i| !pinned.contains(i)).collect();
     if !left.is_empty() {
@@ -1013,51 +1111,41 @@ fn cmd_import(cli: &Cli, file: &Path, all: bool, group: Option<&str>, dry_run: b
 
     // Which packages no index has: the embedded ones are then only in this
     // machine's cache, the others cannot be installed at all.
-    let project = match manifest.is_file() {
-        true => Some((manifest.clone(), project::read(&manifest)?)),
+    let project = match t.manifest.is_file() {
+        true => Some((t.manifest.clone(), project::read(&t.manifest)?)),
         false => None,
     };
-    let idx = match load_index(cli, project.as_ref()) {
-        Ok(idx) => idx,
+    let local_only: Vec<&vipm_interop::VipcPackage> = match load_index(cli, project.as_ref()) {
         Err(e) => {
             wlog!("\ncould not read the package indexes to check availability: {e:#}");
-            return import_done(&vipc, dry_run, &file_name, &[]);
+            Vec::new()
+        }
+        Ok(idx) => {
+            let hosted = |p: &vipm_interop::VipcPackage| {
+                idx.versions_of(&p.name).iter().any(|e| !index::is_local_url(&e.url) && e.version.raw == p.version)
+            };
+            let missing: Vec<&vipm_interop::VipcPackage> = pinned
+                .iter()
+                .map(|&i| &vipc.packages[i])
+                .filter(|p| p.embedded.is_none() && !idx.versions_of(&p.name).iter().any(|e| e.version.raw == p.version))
+                .collect();
+            if !missing.is_empty() {
+                wlog!("\nnot on any index lvpm reads, nor in the cache; installing them will fail:");
+                for p in &missing {
+                    wlog!("  {} {}", p.name, p.version);
+                }
+                wlog!("  add the index that has them under [sources], or `lvpm cache add` the .vip files");
+            }
+            vipc.packages.iter().filter(|p| p.embedded.is_some() && !hosted(p)).collect()
         }
     };
-    let hosted = |p: &vipm_interop::VipcPackage| {
-        idx.versions_of(&p.name).iter().any(|e| !index::is_local_url(&e.url) && e.version.raw == p.version)
-    };
-    let local_only: Vec<&vipm_interop::VipcPackage> =
-        vipc.packages.iter().filter(|p| p.embedded.is_some() && !hosted(p)).collect();
-    let missing: Vec<&vipm_interop::VipcPackage> = pinned
-        .iter()
-        .map(|&i| &vipc.packages[i])
-        .filter(|p| p.embedded.is_none() && !idx.versions_of(&p.name).iter().any(|e| e.version.raw == p.version))
-        .collect();
-    if !missing.is_empty() {
-        wlog!("\nnot on any index lvpm reads, nor in the cache; installing them will fail:");
-        for p in &missing {
-            wlog!("  {} {}", p.name, p.version);
-        }
-        wlog!("  add the index that has them under [sources], or `lvpm cache add` the .vip files");
-    }
-    import_done(&vipc, dry_run, &file_name, &local_only)
-}
-
-/// The closing note of `lvpm import`: packages only this machine's cache has.
-fn import_done(
-    vipc: &vipm_interop::Vipc,
-    dry_run: bool,
-    file_name: &str,
-    local_only: &[&vipm_interop::VipcPackage],
-) -> Result<()> {
     if !local_only.is_empty() {
         log!(
             "\nnote: {} package(s) {} only in your local package cache: no index lvpm reads has these versions.",
             local_only.len(),
             if dry_run { "would be" } else { "are" }
         );
-        for p in local_only {
+        for p in &local_only {
             log!("  {} {}", p.name, p.version);
         }
         log!(
@@ -1068,20 +1156,20 @@ fn import_done(
     if vipc.packages.is_empty() {
         log!("\n{file_name} lists no packages");
     }
-    match dry_run {
-        true => log!("\ndry run: nothing written"),
-        false => log!("\nnext: `lvpm install` installs them"),
-    }
-    Ok(())
+    import_finish(&t)
 }
 
-/// Read a manifest file. A `vipm.toml` goes through the VIPM conversion; it
-/// is only ever reached through `--manifest`, never discovered.
+/// Read a manifest file. lvpm's manifest is `lvpm.toml` (under any name
+/// `--manifest` gives it); a `vipm.toml` is refused with the way in.
 fn read_manifest(path: &Path) -> Result<project::Project> {
-    match vipm_interop::is_toml(path) {
-        true => vipm_interop::read_toml(path),
-        false => project::read(path),
-    }
+    ensure!(
+        !vipm_interop::is_toml(path),
+        "{} is VIPM's manifest; lvpm reads an lvpm.toml\n\
+         hint: `lvpm import {}` writes it into the project's lvpm.toml once",
+        path.display(),
+        path.display()
+    );
+    project::read(path)
 }
 
 /// Every index the command should see: global local folders plus hosted
@@ -1197,7 +1285,7 @@ fn cmd_uninstall(
                 _ => None,
             };
             let editable = match &dest {
-                Destination::Venv(v) if !no_save => editable_manifest(v)?,
+                Destination::Venv(v) if !no_save => Some(editable_manifest(v)?),
                 _ => None,
             };
             let mut project_roots = match &project_manifest {
@@ -3216,7 +3304,8 @@ mod tests {
         assert!(project_uninstall_roots(&path).is_err());
         let vipm = dir.join("vipm.toml");
         std::fs::write(&vipm, "[dependencies]\ncommon = \"1.0\"\n[dev-dependencies]\ntest = \"1.0\"\n").unwrap();
-        assert_eq!(project_uninstall_roots(&vipm).unwrap(), ["common", "test"]);
+        let err = format!("{:#}", project_uninstall_roots(&vipm).unwrap_err());
+        assert!(err.contains("lvpm import"), "a vipm.toml is refused with the way in: {err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3224,22 +3313,28 @@ mod tests {
     fn venv_uses_its_bound_manifest_and_reports_when_it_is_missing() {
         let dir = std::env::temp_dir().join(format!("lvpm-bound-manifest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let vipm = dir.join("vipm.toml");
-        std::fs::write(&vipm, "[dependencies]\npinned = \"1.0\"\n").unwrap();
+        let bound = dir.join("app.toml");
+        std::fs::write(&bound, "[dependencies]\npinned = \"1.0\"\n").unwrap();
         std::fs::write(dir.join("lvpm.toml"), "[dependencies]\nother = \"*\"\n").unwrap();
         let cli = Cli::try_parse_from(["lvpm", "install"]).unwrap();
         let mut v = venv::Venv {
             repo: dir.clone(), dir: dir.join(".lv-venv"),
             target: target::LvTarget { version: 26.3, bitness: 64, path: dir.join("LabVIEW") },
-            port: 3456, manifest: Some(PathBuf::from("vipm.toml")),
+            port: 3456, manifest: Some(PathBuf::from("app.toml")),
         };
         let (path, project) = manifest_for(&cli, None, Some(&v)).unwrap().unwrap();
-        assert_eq!(path, vipm);
+        assert_eq!(path, bound);
         assert_eq!(project.declared_dependency_names().collect::<Vec<_>>(), ["pinned"]);
         let (_, override_project) = manifest_for(&cli, Some(&dir.join("lvpm.toml")), Some(&v)).unwrap().unwrap();
         assert_eq!(override_project.declared_dependency_names().collect::<Vec<_>>(), ["other"]);
-        std::fs::remove_file(&vipm).unwrap();
+        std::fs::remove_file(&bound).unwrap();
         assert!(manifest_for(&cli, None, Some(&v)).is_err());
+
+        // A venv created from a vipm.toml by an older lvpm: refused, with the way out.
+        std::fs::write(dir.join("vipm.toml"), "[dependencies]\npinned = \"1.0\"\n").unwrap();
+        v.manifest = Some(PathBuf::from("vipm.toml"));
+        let err = format!("{:#}", manifest_for(&cli, None, Some(&v)).unwrap_err());
+        assert!(err.contains("lvpm import"), "{err}");
         v.manifest = None;
         assert!(manifest_for(&cli, None, Some(&v)).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -3281,7 +3376,7 @@ mod tests {
         assert!(install(&["oglib_error", "--with", "a"]).is_err());
         assert!(install(&["oglib_error", "--without", "a"]).is_err());
         assert!(install(&["oglib_error", "--only", "a"]).is_err());
-        assert!(install(&["--manifest", "vipm.toml", "--with", "dev"]).is_ok());
+        assert!(install(&["--manifest", "app.toml", "--with", "dev"]).is_ok());
         assert!(install(&["--with", "a", "--without", "b"]).is_ok());
     }
 }

@@ -143,7 +143,7 @@ wins over the overlay; `LVAddons.AdditionalLocations` needs LabVIEW 2024 Q1.
 `lvpm.toml` (done: exact pins, `>=` floors, `*`, hosted `[sources]` and
 `defaults = false`, `labview` minimum, `[nipm.dependencies]`). Local package
 directories are user-level `sources.local` settings, not manifest sources.
-Reference and `vipm.toml` comparison: [manifest.md](manifest.md).
+Reference: [manifest.md](manifest.md); VIPM's files: [compatibility.md](compatibility.md).
 
 - **`lvpm.lock`** — the resolved closure (name, version, source URL, MD5) so
   `lvpm install` restores the identical venv on another machine and only
@@ -161,8 +161,8 @@ Reference and `vipm.toml` comparison: [manifest.md](manifest.md).
   formatting are kept (`toml_edit`). No separate `add` / `remove`.
 - **Constraint grammar (Cargo)** — bare and `^` caret, `~` tilde, `=`
   exact, `>=` floor, `*` newest, in every dependency table; `name@x` stays
-  CLI-only. Breaking: a bare version is exact today. `vipm.toml` bare
-  versions are read as `=x`.
+  CLI-only. Breaking: a bare version is exact today. `lvpm import` then
+  writes VIPM's bare versions as `=x`.
 - **`[dependencies.<name>]`** — done: named group tables shaped like
   `[dependencies]` with a reserved `include-groups = [...]` key, selected
   with `--with`, `--without`, `--only`; only `main` installs by default.
@@ -171,12 +171,13 @@ Reference and `vipm.toml` comparison: [manifest.md](manifest.md).
 - Per-dependency tables: `hooks` is done (`{ version = "...", hooks = "run" }`);
   `source = "local"` is still open.
 - `[venv]` overrides: `dir`, `vi-server-port`, `bitness`.
-- **`vipm.toml` conversion** — done for `--manifest vipm.toml`
-  (`src/vipm_interop.rs`: `labview-version`, exact `[dependencies]`,
-  `[dev-dependencies]` as group `dev`, `[nipm.dependencies]`, a note naming
-  what was not used). Not discovered; whether it should be is an open
-  decision in [manifest.md](manifest.md#to-do). Mapping in
-  [manifest.md](manifest.md#reading-a-vipmtoml-with-lvpm).
+- **VIPM's files** — done as `lvpm import`, which writes a `vipm.toml` or a
+  `.vipc` into the project's `lvpm.toml` once (`src/vipm_interop.rs`:
+  `labview-version`, exact `[dependencies]`, `[dev-dependencies]` as group
+  `dev`, `[nipm.dependencies]`, a note naming what was not used; for a
+  `.vipc`, its top-level packages, and the packages it carries into the
+  cache). lvpm never reads a `vipm.toml` as a manifest. Mapping in
+  [compatibility.md](compatibility.md).
 
 ## Configuration
 

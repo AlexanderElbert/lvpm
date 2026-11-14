@@ -1,13 +1,13 @@
-//! VIPM interoperability: VIPM's project files read into lvpm's model.
+//! VIPM interoperability: VIPM's project files, read for `lvpm import`.
 //!
-//! `vipm.toml` (VIPM 2026 and later) is converted field by field into a
-//! [`Project`], so the rest of lvpm only ever sees one manifest model. The
-//! mapping follows VIPM's published documentation (docs.vipm.io) and is listed
-//! in docs/manifest.md. Every conversion is announced on stderr, naming the
-//! fields with no lvpm equivalent rather than dropping them silently.
+//! lvpm's manifest is `lvpm.toml` only. VIPM's files come in once, through
+//! `lvpm import`, which writes them into an `lvpm.toml`:
 //!
-//! A `.vipc` (VI Package Configuration) is read by [`read_vipc`] for
-//! `lvpm import`, which writes its packages into an `lvpm.toml` once.
+//! - `vipm.toml` (VIPM 2026 and later) is converted field by field into a
+//!   [`Project`] by [`read_toml`]. The mapping follows VIPM's published
+//!   documentation (docs.vipm.io) and is listed in docs/compatibility.md;
+//!   fields with no lvpm equivalent are named rather than dropped silently.
+//! - A `.vipc` (VI Package Configuration) is read by [`read_vipc`].
 
 use crate::project::{Constraint, Group, Project};
 use crate::version::Version;
@@ -24,6 +24,8 @@ pub const DEV_GROUP: &str = "dev";
 #[derive(Debug)]
 pub struct Converted {
     pub project: Project,
+    /// `[nipm.dependencies]` as written, for copying into an `lvpm.toml`.
+    pub nipm: Vec<(String, toml::Value)>,
     /// Dotted names of the fields lvpm did not use, in file order.
     pub unused: Vec<String>,
 }
@@ -34,27 +36,16 @@ pub fn is_toml(path: &Path) -> bool {
         .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(TOML_FILE_NAME))
 }
 
-/// Read and convert a `vipm.toml`, reporting the conversion on stderr.
-pub fn read_toml(path: &Path) -> Result<Project> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading manifest {}", path.display()))?;
-    let c = parse_toml(&text).with_context(|| format!("parsing VIPM manifest {}", path.display()))?;
-    elog!("manifest: {} (VIPM format, converted)", path.display());
-    if !c.unused.is_empty() {
-        elog!("  not used: {}", c.unused.join(", "));
-    }
-    if let Some(lv) = &c.project.labview {
-        elog!("  labview-version {lv:?} read as minimum labview = {lv:?}");
-    }
-    if c.project.groups.iter().any(|(n, _)| n == DEV_GROUP) {
-        elog!("  [dev-dependencies] read as group {DEV_GROUP:?} (install with --with {DEV_GROUP})");
-    }
-    Ok(c.project)
+/// Read and convert a `vipm.toml`.
+pub fn read_toml(path: &Path) -> Result<Converted> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    parse_toml(&text).with_context(|| format!("reading VIPM manifest {}", path.display()))
 }
 
 pub fn parse_toml(text: &str) -> Result<Converted> {
     let doc: toml::Table = toml::from_str(text)?;
     let mut project = Project::default();
+    let mut nipm = Vec::new();
     let mut unused = Vec::new();
     for (key, value) in doc {
         match key.as_str() {
@@ -86,7 +77,10 @@ pub fn parse_toml(text: &str) -> Result<Converted> {
             "nipm" => {
                 for (k, v) in table(&key, value)? {
                     match k.as_str() {
-                        "dependencies" => project.nipm = table(&k, v)?.into_iter().map(|(n, _)| n).collect(),
+                        "dependencies" => {
+                            nipm = table(&k, v)?.into_iter().collect();
+                            project.nipm = nipm.iter().map(|(n, _): &(String, toml::Value)| n.clone()).collect();
+                        }
                         _ => unused.push(format!("{key}.{k}")),
                     }
                 }
@@ -95,7 +89,7 @@ pub fn parse_toml(text: &str) -> Result<Converted> {
             _ => unused.push(key),
         }
     }
-    Ok(Converted { project, unused })
+    Ok(Converted { project, nipm, unused })
 }
 
 fn table(key: &str, value: toml::Value) -> Result<toml::Table> {
@@ -427,6 +421,8 @@ path = "InstrumentControl.vipb"
             ]
         );
         assert_eq!(p.nipm, ["ni-daqmx", "ni-visa"]);
+        assert_eq!(c.nipm[0].1.get("feed").and_then(|f| f.as_str()), Some("ni-daq"), "kept as written");
+        assert_eq!(c.nipm[1].1.as_str(), Some("24.0"));
         assert_eq!(
             p.groups,
             vec![(

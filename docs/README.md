@@ -6,7 +6,8 @@
 | --- | --- |
 | [installation.md](installation.md) | Installing lvpm: the install script, by hand, from source, testing a local build |
 | [commands.md](commands.md) | Every command and flag; uninstalling with dependencies |
-| [manifest.md](manifest.md) | `lvpm.toml`: dependencies, constraints, groups, sources, `hooks` and `relink`, `vipm.toml` compatibility |
+| [manifest.md](manifest.md) | `lvpm.toml`: dependencies, constraints, groups, sources, `hooks` and `relink` |
+| [compatibility.md](compatibility.md) | VIPM's files: `lvpm import` of a `vipm.toml` or a `.vipc`, and how VIPM and lvpm differ |
 | [venvs.md](venvs.md) | Per-project dependencies: creating a venv, `lvpm launch`, its layout and how the overlay works |
 | [install-process.md](install-process.md) | What an install does in LabVIEW: linkfix, relinking, install hooks, VI Server |
 | [package-sources.md](package-sources.md) | The public package directories, your own indexes, local folders and the cache |
