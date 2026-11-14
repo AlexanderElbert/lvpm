@@ -54,10 +54,12 @@ saved for LabVIEW 2020, so any LabVIEW from 2020 on can load it.
   fresh reference and backoff.
 - `lvpm relink <name>` / `lvpm relink --all` reruns the pass from the
   install manifests, without reinstalling.
-- The relink VI is compiled into the `lvpm` binary and unpacked to
-  `%LOCALAPPDATA%\lvpm\tools\<hash>\` on first use, so there is nothing to
-  install beside the executable; `LVPM_RELINK_VI=<path>` runs a VI from disk
-  instead.
+- The relink VI ships beside the executable as `relink-package.vi` (a
+  source build uses `src/lv-src/` in its checkout) and is copied to
+  `%LOCALAPPDATA%\lvpm\tools\<hash>\` on first use. lvpm records the VI's
+  hash at build time and refuses a different one; `LVPM_RELINK_VI=<path>`
+  runs a VI from disk instead, unchecked. It used to be compiled into the
+  executable, which Microsoft Defender took for a dropper.
 
 ## Script-VI hooks
 

@@ -168,7 +168,7 @@ pub fn plan(roots: &Roots, spec: &Spec, zip: &mut Archive) -> Result<Plan> {
     // between `spec` and the archive.
     let mut by_lower = std::collections::HashMap::new();
     for i in 0..zip.len() {
-        let name = zip.by_index(i)?.name().to_string();
+        let name = zip.by_index(i)?.name().with_context(|| format!("archive entry {i} has no usable name"))?.to_string();
         by_lower.insert(name.to_lowercase().replace('\\', "/"), i);
     }
 

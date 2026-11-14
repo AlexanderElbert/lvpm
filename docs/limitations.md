@@ -20,9 +20,6 @@
   that drops palette files into the overlay is picked up at the next
   `lvpm launch`, not by a refresh. Uninstall hooks still never run in a venv,
   whose LabVIEW has to be closed before its files can be removed.
-  `lvpm install <name>` in a venv does not
-  add the pin to `lvpm.toml`. No warning yet when a global copy of a venv
-  package shadows it.
 - `lvpm launch` checks install records, not file contents: a package VI
   edited or resaved since install is not detected.
 

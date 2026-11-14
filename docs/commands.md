@@ -51,6 +51,10 @@ Inside a project, `--with <GROUP>`, `--without <GROUP>` and `--only <GROUP>`
 choose the manifest's dependency groups (see
 [manifest.md](manifest.md#named-dependency-groups)).
 
+In a venv, `lvpm install <name>` also writes the package into `lvpm.toml`
+(`--group <GROUP>` picks the group, `--no-save` skips it); see
+[venvs.md](venvs.md).
+
 ## `launch`
 
 `lvpm launch [<lvproj>]` starts a LabVIEW on the project's venv and optionally
@@ -61,13 +65,15 @@ report. `--no-check` skips the check of the venv against the manifest. See
 
 ## `uninstall` and dependencies
 
-`lvpm uninstall <name>` warns if another installed package requires the
-named package. If it has installed dependencies that are not needed by other
+`lvpm uninstall <name>` refuses a package another installed package
+requires, naming those packages; `--force` removes it anyway, leaving them
+without it. If it has installed dependencies that are not needed by other
 packages, lvpm asks whether to remove them too. Shared dependencies (and
 dependencies they need) are kept and reported. In a venv, packages declared
 in any group of its bound project manifest, and their transitive dependencies,
-are also kept. Explicitly uninstalling a declared package warns but proceeds;
-uninstall never edits the manifest.
+are also kept. Uninstalling a declared package by name also removes it from
+the manifest, so what only it needed can go with it; with `--no-save` it
+stays declared, and lvpm warns.
 
 For scripts, pass `--with-deps` to remove unshared dependencies or
 `--keep-deps` to keep them without prompting. Without either option, an

@@ -6,8 +6,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Flydroid/lvpm/actions/workflows/build.yml"><img alt="build" src="https://github.com/Flydroid/lvpm/actions/workflows/build.yml/badge.svg"></a>
-  <a href="https://github.com/Flydroid/lvpm/releases"><img alt="release" src="https://img.shields.io/github/v/release/Flydroid/lvpm?include_prereleases&sort=semver"></a>
+  <a href="https://github.com/labview-package-manager/lvpm/actions/workflows/build.yml"><img alt="build" src="https://github.com/labview-package-manager/lvpm/actions/workflows/build.yml/badge.svg"></a>
+  <a href="https://github.com/labview-package-manager/lvpm/releases"><img alt="release" src="https://img.shields.io/github/v/release/labview-package-manager/lvpm?include_prereleases&sort=semver"></a>
   <a href="#license"><img alt="license: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue"></a>
 </p>
 
@@ -60,20 +60,28 @@ $ lvpm launch MyProject.lvproj
 ## Install
 
 Windows 10/11 with LabVIEW 2020 or later (venvs need LabVIEW 2024 Q1 or
-later). In PowerShell:
+later). Run the MSI from the
+[Releases](https://github.com/labview-package-manager/lvpm/releases) page, or
+in PowerShell:
 
 ```powershell
 cd $env:TEMP
-irm https://raw.githubusercontent.com/Flydroid/lvpm/main/scripts/install.ps1 -OutFile install.ps1
+irm https://raw.githubusercontent.com/labview-package-manager/lvpm/main/scripts/install.ps1 -OutFile install.ps1
 .\install.ps1
 ```
 
-The script verifies the release's SHA-256, installs `lvpm.exe` per-user to
-`%LOCALAPPDATA%\lvpm\bin` and adds it to your `PATH`; no elevation needed.
+The script verifies the MSI's SHA-256 and installs it quietly: `lvpm.exe`
+and `relink-package.vi` per-user in `%LOCALAPPDATA%\lvpm\bin`, on your
+`PATH`, removable under **Settings → Apps**; no elevation needed.
 
-On Linux there is no release download yet: build from source
-(`cargo build --release`) or take `lvpm-<version>-linux-x64.tar.gz` from a CI
-run's artifacts. Manual install, building from source and Linux are covered
+On Linux x64 (from v0.3.1):
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/labview-package-manager/lvpm/main/scripts/install.sh
+sh install.sh
+```
+
+Script options, the portable zip, building from source and Linux are covered
 in [docs/installation.md](docs/installation.md) and
 [docs/linux.md](docs/linux.md).
 

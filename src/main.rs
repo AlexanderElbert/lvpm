@@ -34,6 +34,7 @@ mod project;
 mod refresh;
 mod relink;
 mod resolve;
+mod shadow;
 mod spec;
 mod target;
 mod venv;
@@ -78,8 +79,8 @@ struct Cli {
     #[arg(long, global = true)]
     refresh: bool,
 
-    /// Detail written to the log file (`.lv-venv/logs/lvpm.log`, or the user's
-    /// global one outside a venv): off, error, warn, info, debug or trace.
+    /// Detail written to the log file (the venv's own, or `lvpm.log` outside a
+    /// venv, in lvpm's log folder): off, error, warn, info, debug or trace.
     /// Default: `LVPM_LOG`, else debug. The console output does not change.
     #[arg(long = "log-level", global = true, value_name = "LEVEL")]
     log_level: Option<String>,
@@ -117,6 +118,18 @@ struct GroupArgs {
     only: Vec<String>,
 }
 
+/// Whether `install <pkg>` writes the package into the venv's manifest.
+#[derive(clap::Args, Clone)]
+struct SaveArgs {
+    /// Install without adding the package to the project's lvpm.toml.
+    #[arg(long, requires = "package")]
+    no_save: bool,
+    /// The dependency group to save the package in (`main` is
+    /// [dependencies]). Default: the group already declaring it, else main.
+    #[arg(long, value_name = "GROUP", requires = "package", conflicts_with = "no_save")]
+    group: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// List detected LabVIEW installations.
@@ -130,6 +143,10 @@ enum Cmd {
     },
     /// Install a package by name, or name@version — or every dependency a
     /// project manifest lists, with `--manifest`.
+    ///
+    /// On a venv, a package installed by name is also written into the
+    /// project's lvpm.toml (the version asked for, else the one installed);
+    /// `--no-save` leaves the manifest alone.
     Install {
         /// Package to install. Omit when using --manifest.
         package: Option<String>,
@@ -170,6 +187,8 @@ enum Cmd {
         allow_downgrade: bool,
         #[command(flatten)]
         groups: GroupArgs,
+        #[command(flatten)]
+        save: SaveArgs,
         #[command(flatten)]
         relink: RelinkArgs,
     },
@@ -215,9 +234,16 @@ enum Cmd {
         timeout: u64,
     },
     /// Remove a previously installed package.
+    ///
+    /// On a venv, a package uninstalled by name is also taken out of the
+    /// project's lvpm.toml, from every group declaring it; `--no-save` leaves
+    /// the manifest alone. `--all` never edits it.
     Uninstall {
         /// Package to remove. Omit when using --all.
         package: Option<String>,
+        /// Uninstall without removing the package from the project's lvpm.toml.
+        #[arg(long, conflicts_with = "all")]
+        no_save: bool,
         /// Remove every package installed in this target.
         #[arg(long, conflicts_with = "package")]
         all: bool,
@@ -227,6 +253,10 @@ enum Cmd {
         /// Keep dependencies, without prompting.
         #[arg(long, conflicts_with_all = ["all", "with_deps"])]
         keep_deps: bool,
+        /// Remove the package even though other installed packages require
+        /// it, leaving them without it. Without this, that is refused.
+        #[arg(long, conflicts_with = "all")]
+        force: bool,
     },
     /// Invoke parameterless Application-class methods by raw id, and report
     /// what LabVIEW says. Re-establishes method ids on a new LabVIEW: 1036
@@ -395,7 +425,7 @@ fn main() -> Result<()> {
     };
     logging::init(level);
     let result = run(&cli);
-    logging::finish(&result, state_dir().ok().map(|d| d.join("logs")));
+    logging::finish(&result);
     result
 }
 
@@ -415,6 +445,7 @@ fn run(cli: &Cli) -> Result<()> {
             run_hooks,
             allow_downgrade,
             groups,
+            save,
             relink,
         } => {
             let started = std::time::Instant::now();
@@ -430,6 +461,7 @@ fn run(cli: &Cli) -> Result<()> {
                 *run_hooks,
                 *allow_downgrade,
                 groups,
+                save,
                 relink,
             );
             let took = took(started.elapsed());
@@ -445,8 +477,8 @@ fn run(cli: &Cli) -> Result<()> {
             cmd_run_hooks(&cli, package.as_deref(), *all, *timeout)
         }
         Cmd::Refresh { timeout } => cmd_refresh(&cli, *timeout),
-        Cmd::Uninstall { package, all, with_deps, keep_deps } =>
-            cmd_uninstall(&cli, package.as_deref(), *all, *with_deps, *keep_deps),
+        Cmd::Uninstall { package, no_save, all, with_deps, keep_deps, force } =>
+            cmd_uninstall(&cli, package.as_deref(), *all, *with_deps, *keep_deps, *no_save, *force),
         Cmd::AppProbe { ids } => cmd_app_probe(&cli, ids),
         Cmd::ViProbe { vi, timeout } => cmd_vi_probe(&cli, vi, *timeout),
         Cmd::ViSave { vi } => cmd_vi_save(&cli, vi),
@@ -768,6 +800,57 @@ fn manifest_for(
     }
 }
 
+/// `[dependencies]` for `main`, else `[dependencies.<group>]`.
+fn group_label(group: &str) -> String {
+    match group == project::MAIN_GROUP {
+        true => "[dependencies]".to_string(),
+        false => format!("[dependencies.{group}]"),
+    }
+}
+
+/// The venv's manifest, when lvpm may edit it: a `vipm.toml` is VIPM's, and
+/// is read but never written.
+fn editable_manifest(v: &venv::Venv) -> Result<Option<PathBuf>> {
+    let path = v.manifest_path().context("venv has no bound manifest")?;
+    if vipm_interop::is_toml(&path) {
+        log!(
+            "\nnote: {} is a VIPM manifest; lvpm does not edit it",
+            path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+        );
+        return Ok(None);
+    }
+    Ok(Some(path))
+}
+
+/// Write a package installed by name into the venv's manifest. A failure is
+/// reported, not raised: the package is installed either way.
+fn save_to_manifest(v: &venv::Venv, group: Option<&str>, name: &str, version: &str, dry_run: bool) {
+    let saved = editable_manifest(v).and_then(|path| {
+        let Some(path) = path else { return Ok(()) };
+        let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if dry_run {
+            let into = group.map(group_label).unwrap_or_else(|| "its group".to_string());
+            log!("\nwould save {name} = \"{version}\" to {file} ({into})");
+            return Ok(());
+        }
+        match project::save_dependency(&path, group, name, version)? {
+            project::Saved::Added { group } => {
+                log!("\nsaved {name} = \"{version}\" to {file} {}", group_label(&group))
+            }
+            project::Saved::Updated { group, from } => {
+                log!("\nupdated {name} in {file} {}: \"{from}\" -> \"{version}\"", group_label(&group))
+            }
+            project::Saved::Unchanged { group } => {
+                log!("\n{name} = \"{version}\" is already in {file} {}", group_label(&group))
+            }
+        }
+        Ok(())
+    });
+    if let Err(e) = saved {
+        wlog!("\n{name} is installed, but the manifest was not updated: {e:#}");
+    }
+}
+
 /// Read a manifest file. A `vipm.toml` goes through the VIPM conversion; it
 /// is only ever reached through `--manifest`, never discovered.
 fn read_manifest(path: &Path) -> Result<project::Project> {
@@ -875,9 +958,13 @@ fn cmd_refresh(cli: &Cli, timeout: u64) -> Result<()> {
     Ok(())
 }
 
-fn cmd_uninstall(cli: &Cli, package: Option<&str>, all: bool, with_deps: bool, keep_deps: bool) -> Result<()> {
+fn cmd_uninstall(
+    cli: &Cli, package: Option<&str>, all: bool, with_deps: bool, keep_deps: bool, no_save: bool, force: bool,
+) -> Result<()> {
     let dest = destination(cli)?;
     let roots = dest.store();
+    // The manifest a package uninstalled by name is taken out of, and its name.
+    let mut unsave: Option<(PathBuf, String)> = None;
     let names: Vec<String> = match (package, all) {
         (Some(p), _) => {
             let installed = install::list_installed(&roots)?;
@@ -885,18 +972,41 @@ fn cmd_uninstall(cli: &Cli, package: Option<&str>, all: bool, with_deps: bool, k
                 Destination::Venv(v) => Some(v.manifest_path().context("venv has no bound manifest")?),
                 _ => None,
             };
-            let project_roots = match &project_manifest {
+            let editable = match &dest {
+                Destination::Venv(v) if !no_save => editable_manifest(v)?,
+                _ => None,
+            };
+            let mut project_roots = match &project_manifest {
                 Some(path) => project_uninstall_roots(path)?,
                 None => Vec::new(),
             };
+            // A package leaving the manifest is no longer one of its roots,
+            // so what only it needed may go with it.
+            if editable.is_some() {
+                project_roots.retain(|root| !root.eq_ignore_ascii_case(p));
+            }
             let manifest_name = project_manifest.as_ref().and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project manifest".into());
             let plan = dependency::removal_plan(&installed, p, &project_roots)?;
             if plan.project_declared {
                 elog!("warning: {} is declared in {}; uninstall does not edit the manifest", plan.root, manifest_name);
             }
+            if let Some(path) = editable {
+                unsave = Some((path, plan.root.clone()));
+            }
+            // Removing what another installed package needs leaves that one
+            // broken: refused before anything is touched, unless --force.
             if !plan.dependents.is_empty() {
-                elog!("warning: {} is required by installed packages: {}", plan.root, plan.dependents.join(", "));
+                ensure!(
+                    force,
+                    "{} is required by installed packages: {}\n\
+                     hint: uninstall {} first, or pass --force to remove {} anyway",
+                    plan.root,
+                    plan.dependents.join(", "),
+                    plan.dependents.join(", "),
+                    plan.root
+                );
+                elog!("warning: {} is required by installed packages: {} (--force)", plan.root, plan.dependents.join(", "));
             }
             for (name, owners) in &plan.kept {
                 if plan.project_kept.iter().any(|kept| kept.eq_ignore_ascii_case(name)) {
@@ -951,6 +1061,20 @@ fn cmd_uninstall(cli: &Cli, package: Option<&str>, all: bool, with_deps: bool, k
     }
     if let Some(c) = conn {
         c.close();
+    }
+
+    // Uninstalled by name on a venv (a failure has returned already): out of
+    // the manifest too, from every group declaring it.
+    if let Some((path, name)) = &unsave {
+        let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match project::remove_dependency(path, name) {
+            Ok(groups) if groups.is_empty() => {}
+            Ok(groups) => log!(
+                "removed {name} from {file} {}",
+                groups.iter().map(|g| group_label(g)).collect::<Vec<_>>().join(", ")
+            ),
+            Err(e) => wlog!("{name} is uninstalled, but the manifest was not updated: {e:#}"),
+        }
     }
 
     // The same reason as on install, in reverse: the packages' `.mnu` files
@@ -1114,6 +1238,7 @@ fn cmd_install(
     run_hooks: bool,
     allow_downgrade: bool,
     groups: &GroupArgs,
+    save: &SaveArgs,
     relink_args: &RelinkArgs,
 ) -> Result<()> {
     // Headless (containers, CI): the hooks measured (DQMH's six) write a
@@ -1220,6 +1345,26 @@ fn cmd_install(
     }
 
     let plan = resolution.plan;
+
+    // What a package named on a venv is saved as: the version asked for
+    // (`name@1.2.3`, `name@>=1.2`), else the one resolved, under the index's
+    // spelling of the name.
+    let save_entry: Option<(String, String)> = match (package, &venv) {
+        (Some(p), Some(_)) if !save.no_save => {
+            let (name, asked) = match p.split_once('@') {
+                Some((n, v)) => (n, Some(v)),
+                None => (p, None),
+            };
+            plan.iter()
+                .find(|e| e.name.eq_ignore_ascii_case(name))
+                .map(|e| (e.name.clone(), asked.map_or_else(|| e.version.to_string(), str::to_string)))
+        }
+        (Some(_), None) if save.group.is_some() => {
+            elog!("note: --group only applies on a venv; nothing is saved to a manifest here");
+            None
+        }
+        _ => None,
+    };
 
     log!("\nresolved {} package{}:", plan.len(), if plan.len() == 1 { "" } else { "s" });
     for e in &plan {
@@ -1534,6 +1679,13 @@ fn cmd_install(
         }
     }
 
+    // The files are installed: a package named on a venv goes into its
+    // manifest now, before LabVIEW gets involved, so a relink or hook that
+    // fails later does not leave the venv holding an undeclared package.
+    if let (Some((name, version)), Some(v)) = (&save_entry, &venv) {
+        save_to_manifest(v, save.group.as_deref(), name, version, dry_run);
+    }
+
     // Relinking and the PostInstall hooks are the second phase, and both need
     // a LabVIEW: a scratch tree has none, so both are skipped there. They
     // share one instance, because starting a venv's LabVIEW twice costs more
@@ -1650,6 +1802,15 @@ fn cmd_install(
             // Nothing to refresh: a scratch tree's palettes belong to no IDE.
             None => {}
         }
+    }
+    // What this install put in the venv that the LabVIEW installation has a
+    // copy of too: that copy is the one LabVIEW would load.
+    if let Some(v) = &venv
+        && !dry_run
+    {
+        let records: Vec<install::Manifest> =
+            plan.iter().filter_map(|e| install::read_manifest(&store, &e.name).ok()).collect();
+        shadow::warn(v, &shadow::find(v, &records));
     }
     if total_writes > 0 && !dry_run && venv.is_some() {
         log!("\nnext: `lvpm launch` starts LabVIEW on this venv — a LabVIEW already open on it");
@@ -2045,6 +2206,7 @@ fn cmd_venv(cli: &Cli, sub: &VenvCmd) -> Result<()> {
             log!("created {}", v.dir.display());
             log!("  bound to       {}  ({})", v.target.label(), v.target.path.display());
             log!("  VI Server port {}", v.port);
+            log!("  log            {}", v.log_path().display());
             log!("\nnext: {install_hint} into it, `lvpm launch` starts LabVIEW on it");
             Ok(())
         }
@@ -2070,6 +2232,13 @@ fn cmd_venv(cli: &Cli, sub: &VenvCmd) -> Result<()> {
                         "not running on this venv"
                     }
                 );
+                log!("  log            {}", v.log_path().display());
+                let shadowed = shadow::find(&v, &installed);
+                match shadowed.is_empty() {
+                    true => log!("  shadowed       none: LabVIEW has no copy of its own of any of them"),
+                    false => log!("  shadowed       {} also in LabVIEW {} (below)", shadowed.len(), v.target.year()),
+                }
+                shadow::warn(&v, &shadowed);
                 Ok(())
             }
             None => {
@@ -2175,6 +2344,10 @@ fn cmd_launch(cli: &Cli, lvproj: Option<&Path>, ini_keys: &[String], no_check: b
     if !no_check {
         check_venv_for_launch(&dest, &v)?;
     }
+    // Not a reason to refuse: the copies may be the same version. But the
+    // user should know which one LabVIEW is about to load.
+    let records = install::list_installed(&v.store()).unwrap_or_default();
+    shadow::warn(&v, &shadow::find(&v, &records));
     let extra = ini_keys
         .iter()
         .map(|kv| {
@@ -2694,7 +2867,7 @@ fn cmd_vi_run(
 fn read_spec(zip: &mut zip::ZipArchive<std::io::Cursor<Vec<u8>>>) -> Result<String> {
     // Almost always literally "spec" at the archive root.
     let idx = (0..zip.len()).find(|i| {
-        zip.by_index(*i).map(|f| f.name().eq_ignore_ascii_case("spec")).unwrap_or(false)
+        zip.by_index(*i).is_ok_and(|f| f.name().is_ok_and(|n| n.eq_ignore_ascii_case("spec")))
     });
     let Some(idx) = idx else {
         bail!("no `spec` member in .vip archive");

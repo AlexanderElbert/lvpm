@@ -23,7 +23,7 @@ OGPT to lvpm.
 | Module                         | Responsibility                                                                                                          |
 | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
 | `main.rs`                      | The CLI: commands, target and venv selection, and install/uninstall orchestration                                       |
-| `logging.rs`                   | The per-venv log file, and the `log!` family of macros that print a line and log it                                    |
+| `logging.rs`                   | The log files (one per venv, in a global folder), and the `log!` family of macros that print a line and log it                                    |
 | `index.rs`                     | Fetch and parse package directories (`.ogpd` / `index.vipr`), resolve names to versions                                |
 | `resolve.rs`                   | Resolve requested packages and dependencies into an installation order                                                  |
 | `dependency.rs`                | Package dependency metadata and dependency-aware uninstall planning                                                     |
@@ -36,12 +36,14 @@ OGPT to lvpm.
 | `venv.rs`                      | A project's `.lv-venv/` venv by default: binding, lookup from the working directory, `lvpm venv`                       |
 | `launch.rs`                    | Start LabVIEW on a venv: the `-pref` ini, readiness by handshake, detached spawning                                     |
 | `linkfix.rs`                   | Rewrite installed VIs' linker tables and separate compiled code, without LabVIEW (see [linkfix.md](linkfix.md))         |
-| `relink.rs`                    | Drive the embedded relink VI over installed folders; folder collapsing and retries                                      |
+| `relink.rs`                    | Drive the shipped relink VI over installed folders; folder collapsing and retries                                       |
 | `refresh.rs`                   | Rebuild palettes and menus through LabVIEW's own shipping VIs                                                           |
 | `viserver.rs`                  | The VI Server TCP protocol: connection, methods, flattened data (see [vi-server-protocol.md](vi-server-protocol.md))   |
 | `version.rs`                   | Package version ordering: OGPT `version-release`, VIPM's four-part form; not semver                                     |
 | `vipm_interop.rs`              | Reading VIPM's `vipm.toml` as an lvpm manifest                                                                          |
-| `src/lv-src/relink-package.vi` | The relink VI embedded into the executable at build time (LabVIEW 2020)                                                 |
-| `scripts/install.ps1`          | Download, verify and install the latest release                                                                         |
+| `src/lv-src/relink-package.vi` | The relink VI, shipped next to the executable; `build.rs` records its hash (LabVIEW 2020)                               |
+| `scripts/install.ps1`          | Download, verify and install the latest release (the MSI, or the zip with `-Portable`)                                 |
+| `scripts/install.sh`           | The same for Linux x64, from the static tarball                                                                         |
+| `dist-workspace.toml`, `wix/`  | Releases: dist builds the archives and the per-user MSI when a version tag is pushed (`release.yml`)                    |
 | `e2e/`                         | `lvpm-e2e`: end-to-end checks against LabVIEW for Linux and for Windows in NI's container images, with local test packages and with public ones (the LabVIEW tree must come out of install and uninstall unchanged) |
 | `tools/linkfix/`               | Python tools for inspecting what linkfix and LabVIEW saves change in a package                                          |

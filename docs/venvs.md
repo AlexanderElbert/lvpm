@@ -12,9 +12,17 @@ created C:\Git\MyProject\.lv-venv
   VI Server port 3735
 
 $ lvpm install                    # everything lvpm.toml lists, into .lv-venv
-$ lvpm install oglib_error        # one more package, into .lv-venv
+$ lvpm install oglib_error        # one more package, into .lv-venv and lvpm.toml
 $ lvpm launch MyProject.lvproj    # a LabVIEW that sees the venv
 ```
+
+On a venv, `lvpm install <name>` also writes the package into `lvpm.toml`:
+the version given with `name@version`, else the one installed. An entry
+that exists is updated in place, in its group; `--group dev` saves into
+`[dependencies.dev]` instead. `lvpm uninstall <name>` takes the package out
+of every group declaring it. Comments and formatting elsewhere in the file
+stay as written. `--no-save` leaves the manifest alone for either command,
+`uninstall --all` never edits it, and a `vipm.toml` is never written.
 
 - `lvpm venv create` makes `.lv-venv/` beside `lvpm.toml` by default and binds it to a
   LabVIEW version: `--labview-version`, else the manifest's `labview`.
@@ -61,11 +69,11 @@ anyway. Files edited or resaved since install are not detected.
   installed/           package installation records
   venv.json            LabVIEW binding
   labview.ini          venv-specific LabVIEW settings
-  logs/lvpm.log        lvpm's log of every command run on this venv
   objcache/ data/ temp/  isolated LabVIEW runtime files
 ```
 
-The log is described in [configuration.md](configuration.md#logs).
+The venv's log lives in lvpm's global log folder, not in the venv; see
+[configuration.md](configuration.md#logs).
 
 ## How it works
 
@@ -91,3 +99,7 @@ Two things follow from LabVIEW reading an addon's contents at launch:
 - The real installation always wins over the overlay: a package installed
   both globally and in the venv loads from the global copy, whatever its
   version. Keep the target installation clean of what the venv provides.
+  lvpm warns when it is not: after an install into the venv, at `lvpm launch`
+  and in `lvpm venv status`, it names every venv package whose LabVIEW files
+  the installation has too (from VIPM, `lvpm install --global` or a copy by
+  hand) and how to remove that copy. The check takes milliseconds.
