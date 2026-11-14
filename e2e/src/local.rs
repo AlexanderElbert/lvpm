@@ -421,7 +421,12 @@ fn uninstall_shared_dependencies() -> Check {
 }
 
 fn uninstall_required_package() -> Check {
-    let result = ok(&venv(), &["uninstall", "lvpm_e2e_shared", "--no-save", "--keep-deps"])?;
+    let refused = lvpm(&venv(), &["uninstall", "lvpm_e2e_shared", "--no-save", "--keep-deps"])
+        .try_failure().map_err(fail)?;
+    contains(&refused, "required by installed packages: lvpm_e2e_other")?;
+    contains(&refused, "--force")?;
+    exists(&record("lvpm_e2e_shared")?)?;
+    let result = ok(&venv(), &["uninstall", "lvpm_e2e_shared", "--no-save", "--keep-deps", "--force"])?;
     contains(&result, "required by installed packages: lvpm_e2e_other")?;
     absent(&record("lvpm_e2e_shared")?)?;
     exists(&record("lvpm_e2e_other")?)

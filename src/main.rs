@@ -253,6 +253,10 @@ enum Cmd {
         /// Keep dependencies, without prompting.
         #[arg(long, conflicts_with_all = ["all", "with_deps"])]
         keep_deps: bool,
+        /// Remove the package even though other installed packages require
+        /// it, leaving them without it. Without this, that is refused.
+        #[arg(long, conflicts_with = "all")]
+        force: bool,
     },
     /// Invoke parameterless Application-class methods by raw id, and report
     /// what LabVIEW says. Re-establishes method ids on a new LabVIEW: 1036
@@ -473,8 +477,8 @@ fn run(cli: &Cli) -> Result<()> {
             cmd_run_hooks(&cli, package.as_deref(), *all, *timeout)
         }
         Cmd::Refresh { timeout } => cmd_refresh(&cli, *timeout),
-        Cmd::Uninstall { package, no_save, all, with_deps, keep_deps } =>
-            cmd_uninstall(&cli, package.as_deref(), *all, *with_deps, *keep_deps, *no_save),
+        Cmd::Uninstall { package, no_save, all, with_deps, keep_deps, force } =>
+            cmd_uninstall(&cli, package.as_deref(), *all, *with_deps, *keep_deps, *no_save, *force),
         Cmd::AppProbe { ids } => cmd_app_probe(&cli, ids),
         Cmd::ViProbe { vi, timeout } => cmd_vi_probe(&cli, vi, *timeout),
         Cmd::ViSave { vi } => cmd_vi_save(&cli, vi),
@@ -955,7 +959,7 @@ fn cmd_refresh(cli: &Cli, timeout: u64) -> Result<()> {
 }
 
 fn cmd_uninstall(
-    cli: &Cli, package: Option<&str>, all: bool, with_deps: bool, keep_deps: bool, no_save: bool,
+    cli: &Cli, package: Option<&str>, all: bool, with_deps: bool, keep_deps: bool, no_save: bool, force: bool,
 ) -> Result<()> {
     let dest = destination(cli)?;
     let roots = dest.store();
@@ -990,8 +994,19 @@ fn cmd_uninstall(
             if let Some(path) = editable {
                 unsave = Some((path, plan.root.clone()));
             }
+            // Removing what another installed package needs leaves that one
+            // broken: refused before anything is touched, unless --force.
             if !plan.dependents.is_empty() {
-                elog!("warning: {} is required by installed packages: {}", plan.root, plan.dependents.join(", "));
+                ensure!(
+                    force,
+                    "{} is required by installed packages: {}\n\
+                     hint: uninstall {} first, or pass --force to remove {} anyway",
+                    plan.root,
+                    plan.dependents.join(", "),
+                    plan.dependents.join(", "),
+                    plan.root
+                );
+                elog!("warning: {} is required by installed packages: {} (--force)", plan.root, plan.dependents.join(", "));
             }
             for (name, owners) in &plan.kept {
                 if plan.project_kept.iter().any(|kept| kept.eq_ignore_ascii_case(name)) {

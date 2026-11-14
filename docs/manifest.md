@@ -213,8 +213,11 @@ comments and formatting (`toml_edit`); a `vipm.toml` is read, never written.
 no longer listed. Use `lvpm uninstall <name>`, or `lvpm uninstall --all`
 followed by `lvpm install`, until `lvpm sync` exists (see [To do](#to-do)).
 Uninstall can also remove unshared dependencies after confirmation; use
-`--with-deps` or `--keep-deps` for non-interactive use. It warns about
-dependents and keeps shared dependencies. Old installation records without
+`--with-deps` or `--keep-deps` for non-interactive use. It refuses a
+package other installed packages require (`--force` overrides) and keeps
+shared dependencies. A dependency the project needs only through the package
+being removed is not protected by the manifest; it goes, or not, like any
+other unshared dependency. Old installation records without
 dependency information are rejected. Recreate affected venvs and reinstall
 their packages, or uninstall affected global packages with the previous lvpm
 version before reinstalling them.

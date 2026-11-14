@@ -361,8 +361,9 @@ Two things follow from LabVIEW reading an addon's contents at launch:
 
 ### Uninstalling dependencies
 
-`lvpm uninstall <name>` warns if another installed package requires the
-named package. If it has installed dependencies that are not needed by other
+`lvpm uninstall <name>` refuses a package another installed package
+requires, naming those packages; `--force` removes it anyway, leaving them
+without it. If it has installed dependencies that are not needed by other
 packages, lvpm asks whether to remove them too. Shared dependencies (and
 dependencies they need) are kept and reported. In a venv, packages declared
 in any group of its bound project manifest, and their transitive dependencies,
