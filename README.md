@@ -486,6 +486,9 @@ Linkfix's `clfn-wildcard` method now makes that repair itself (see
 works around the same issue differently: its hook unzips clean copies of its
 VIs over the installed ones. linkfix covers that one too.
 
+[docs/packages.md](docs/packages.md) lists which packages' hooks are needed
+in a venv and which can stay skipped.
+
 Hook failures are reported, never fatal: the files are installed either way,
 and an uninstall is never left half-done. After the hooks, a global `install`
 rebuilds the palettes and menus so a package's palette and Tools entries
@@ -695,6 +698,9 @@ runs.
   that drops palette files into the overlay is picked up at the next
   `lvpm launch`, not by a refresh. Uninstall hooks still never run in a venv,
   whose LabVIEW has to be closed before its files can be removed.
+- Some packages don't work in a venv yet (Panther Dashboard for DQMH), and
+  some need their PostInstall hook run by hand (AsciiDoc for LabVIEW).
+  [docs/packages.md](docs/packages.md) lists them.
 
 [docs/roadmap.md](docs/roadmap.md) has what is planned.
 
