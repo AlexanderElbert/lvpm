@@ -60,7 +60,7 @@ of them.
 
 To run a package's PostInstall hook in a venv, opt in per package in
 `lvpm.toml`, or run it once by hand (see
-[Which hooks run](../README.md#script-vi-hooks)):
+[Which hooks run](install-process.md#script-vi-hooks)):
 
 ```toml
 [dependencies]
