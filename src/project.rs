@@ -544,6 +544,35 @@ pub fn remove_dependency(path: &Path, name: &str) -> Result<Vec<String>> {
     Ok(declared.into_iter().map(|(g, _)| g).collect())
 }
 
+/// Set `[project] labview` in `path` unless it is set already; returns the
+/// value already there, if any, which is left alone.
+pub fn set_labview_if_missing(path: &Path, year: &str) -> Result<Option<String>> {
+    let mut edit = Edit::open(path)?;
+    let root = edit.doc.as_table_mut();
+    if !root.contains_key("project") {
+        root.insert("project", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let project = root["project"]
+        .as_table_like_mut()
+        .with_context(|| format!("{}: project is not a table", path.display()))?;
+    if let Some(existing) = project.get("labview") {
+        return Ok(Some(existing.as_str().unwrap_or_default().to_string()));
+    }
+    project.insert("labview", toml_edit::value(year));
+    edit.write()?;
+    Ok(None)
+}
+
+/// The skeleton `lvpm venv create` and `lvpm import` write when a project
+/// has no manifest yet.
+pub fn skeleton(name: &str, labview: Option<&str>) -> String {
+    let quote = |s: &str| toml::Value::String(s.to_string()).to_string();
+    match labview {
+        Some(lv) => format!("[project]\nname = {}\nlabview = {}\n\n[dependencies]\n", quote(name), quote(lv)),
+        None => format!("[project]\nname = {}\n\n[dependencies]\n", quote(name)),
+    }
+}
+
 /// A manifest open for editing.
 struct Edit {
     path: PathBuf,
@@ -1065,6 +1094,27 @@ pkg_a = "*"
         assert!(!after.to_lowercase().contains("caraya"), "{after}");
         assert!(after.contains("oglib_error = \"6.0.1\"  # pinned for a reason"), "{after}");
         assert!(after.contains("vi_tester"), "{after}");
+    }
+
+    #[test]
+    fn labview_is_set_only_when_missing() {
+        let after = edited("# top\n[project]\nname = \"x\"\n", |p| {
+            assert_eq!(set_labview_if_missing(p, "2020")?, None);
+            assert_eq!(set_labview_if_missing(p, "2026")?, Some("2020".into()));
+            Ok(())
+        });
+        assert_eq!(parse(&after).unwrap().labview.as_deref(), Some("2020"));
+        assert!(after.starts_with("# top\n"), "{after}");
+        let after = edited("[dependencies]\n", |p| set_labview_if_missing(p, "2024").map(drop));
+        assert_eq!(parse(&after).unwrap().labview.as_deref(), Some("2024"));
+    }
+
+    #[test]
+    fn the_skeleton_quotes_what_it_is_given() {
+        let p = parse(&skeleton("my \"odd\" project", Some("2025"))).unwrap();
+        assert_eq!(p.name.as_deref(), Some("my \"odd\" project"));
+        assert_eq!(p.labview.as_deref(), Some("2025"));
+        assert_eq!(parse(&skeleton("x", None)).unwrap().labview, None);
     }
 
     #[test]

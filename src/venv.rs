@@ -193,6 +193,34 @@ pub fn locate(cwd: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
+/// The manifest of the project a command is in, for commands that only edit
+/// it (`lvpm import`): the manifest a venv is bound to when the repo has one,
+/// else its `lvpm.toml`. Needs no venv, and does not check that the venv's
+/// LabVIEW is installed. `--project` names the repo; otherwise the nearest
+/// project at or above `cwd`. None outside a project.
+pub fn project_manifest(project: Option<&Path>, cwd: &Path) -> Result<Option<PathBuf>> {
+    let venv_dir = config::load()?.venv_dir;
+    let repo = match project {
+        Some(dir) => Some(std::path::absolute(dir)?),
+        None => match probe_in(cwd, &venv_dir) {
+            Found::Venv(dir) | Found::ManifestOnly(dir) => Some(dir),
+            Found::Nothing => None,
+        },
+    };
+    let Some(repo) = repo else { return Ok(None) };
+    let bp = binding_path(&repo.join(&venv_dir));
+    if bp.is_file() {
+        let text = std::fs::read_to_string(&bp).with_context(|| format!("reading {}", bp.display()))?;
+        let b: Binding = serde_json::from_str(&text).with_context(|| format!("reading {}", bp.display()))?;
+        if let Some(name) = b.manifest {
+            ensure!(name.components().count() == 1, "invalid manifest filename in {}", bp.display());
+            return Ok(Some(repo.join(name)));
+        }
+    }
+    let path = repo.join(project::FILE_NAME);
+    Ok((project.is_some() || path.is_file()).then_some(path))
+}
+
 /// The venv a command means, if any: `--project` names the repo outright,
 /// otherwise it is looked up from `cwd`.
 pub fn find(project: Option<&Path>, cwd: &Path) -> Result<Option<Venv>> {
@@ -329,11 +357,8 @@ pub fn create(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "project".to_string());
-        std::fs::write(
-            &manifest_path,
-            format!("[project]\nname = \"{name}\"\nlabview = \"{}\"\n\n[dependencies]\n", target.year()),
-        )
-        .with_context(|| format!("writing {}", manifest_path.display()))?;
+        std::fs::write(&manifest_path, project::skeleton(&name, Some(&target.year().to_string())))
+            .with_context(|| format!("writing {}", manifest_path.display()))?;
         elog!("wrote {}", manifest_path.display());
     }
 

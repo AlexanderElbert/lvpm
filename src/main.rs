@@ -376,6 +376,23 @@ enum Cmd {
         #[arg(long, value_name = "32|64")]
         bitness: Option<u8>,
     },
+    /// Write a VIPM package configuration (.vipc) into the project's lvpm.toml:
+    /// its top-level packages as exact versions, its LabVIEW as `labview`, and
+    /// the packages it carries into the package cache. Installs nothing.
+    Import {
+        /// The .vipc file.
+        file: PathBuf,
+        /// Pin every package in the file, not only those nothing else in it requires.
+        #[arg(long)]
+        all: bool,
+        /// The dependency group to write into (`main` is [dependencies]).
+        /// Default: the group already declaring a package, else main.
+        #[arg(long, value_name = "GROUP")]
+        group: Option<String>,
+        /// Show what would change; write neither the manifest nor the cache.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show what lvpm has installed into the selected target.
     List,
     /// Search the indexes.
@@ -515,6 +532,7 @@ fn run(cli: &Cli) -> Result<()> {
             ensure!(bitness.is_none_or(|b| b == 32 || b == 64), "--bitness is 32 or 64");
             cmd_linkfix(&cli, tree.as_deref(), *dry_run, *verbose, &methods, report.as_deref(), *bitness)
         }
+        Cmd::Import { file, all, group, dry_run } => cmd_import(&cli, file, *all, group.as_deref(), *dry_run),
         Cmd::List => cmd_list(&cli),
         Cmd::Search { query } => cmd_search(&cli, query),
     }
@@ -849,6 +867,212 @@ fn save_to_manifest(v: &venv::Venv, group: Option<&str>, name: &str, version: &s
     if let Err(e) = saved {
         wlog!("\n{name} is installed, but the manifest was not updated: {e:#}");
     }
+}
+
+/// The manifest `lvpm import` writes: the venv's when one is in effect, else
+/// `--project`'s or the nearest `lvpm.toml`, else a new one in `--project` or
+/// the working directory. The flag says whether it exists yet.
+fn import_manifest(cli: &Cli) -> Result<(PathBuf, bool)> {
+    let cwd = std::env::current_dir()?;
+    let path = match venv::project_manifest(cli.project.as_deref(), &cwd)? {
+        Some(p) => p,
+        None => std::path::absolute(cwd.join(project::FILE_NAME))?,
+    };
+    ensure!(
+        !vipm_interop::is_toml(&path),
+        "this project's venv reads {}, which lvpm does not write; import into an {} instead",
+        path.display(),
+        project::FILE_NAME
+    );
+    let exists = path.is_file();
+    Ok((path, exists))
+}
+
+/// `lvpm import <file.vipc>`: the packages a project would list by hand
+/// (those nothing else in the file requires; every package with `--all`)
+/// into the manifest as exact versions, the target as `labview` when the
+/// manifest has none, and the packages carried in the file into the cache.
+/// Ends by naming the packages that only the local cache has, since a
+/// teammate or CI runner will not have them.
+fn cmd_import(cli: &Cli, file: &Path, all: bool, group: Option<&str>, dry_run: bool) -> Result<()> {
+    ensure!(
+        vipm_interop::is_vipc(file),
+        "lvpm import reads a VIPM package configuration (.vipc); got {}\n\
+         hint: a vipm.toml is used as it is: `lvpm install --manifest vipm.toml`",
+        file.display()
+    );
+    if let Some(g) = group {
+        ensure!(!g.trim().is_empty(), "--group needs a name (`main` is [dependencies])");
+    }
+    let file = std::path::absolute(file)?;
+    let file_name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let vipc = vipm_interop::read_vipc(&file)?;
+    let (manifest, exists) = import_manifest(cli)?;
+    let would = if dry_run { "would " } else { "" };
+
+    log!("import: {} (VIPM package configuration)", file.display());
+    match (&vipc.target, &vipc.labview) {
+        (Some(t), Some(lv)) => log!("  target LabVIEW {t}, read as minimum labview = {lv:?}"),
+        (Some(t), None) => log!("  target LabVIEW {t}, older than lvpm can name by year; labview not set"),
+        (None, _) => log!("  no LabVIEW target"),
+    }
+    if vipc.target.as_deref().is_some_and(|t| t.contains("-bit")) {
+        log!("  bitness not used: lvpm takes it from the LabVIEW the venv is bound to");
+    }
+    for spec in &vipc.unreadable_specs {
+        wlog!("  {spec} is missing or unreadable; that package counts as having no dependencies");
+    }
+
+    let roots = vipc.roots();
+    let pinned: Vec<usize> = match all {
+        true => (0..vipc.packages.len()).collect(),
+        false => roots.clone(),
+    };
+    let by = vipc.required_by(&roots);
+    let embedded = vipc.packages.iter().filter(|p| p.embedded.is_some()).count();
+    log!(
+        "  {} package(s): {} top-level, {} required by them; {embedded} carried in the file",
+        vipc.packages.len(),
+        roots.len(),
+        vipc.packages.len() - roots.len()
+    );
+
+    log!("\nmanifest: {}{}", manifest.display(), if exists { "" } else { " (new)" });
+    if !exists && !dry_run {
+        let name = manifest
+            .parent()
+            .and_then(|d| d.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "project".to_string());
+        std::fs::write(&manifest, project::skeleton(&name, vipc.labview.as_deref()))
+            .with_context(|| format!("writing {}", manifest.display()))?;
+    }
+    if let Some(lv) = &vipc.labview {
+        match exists {
+            false => log!("  {would}set labview = {lv:?}"),
+            true if dry_run => match project::read(&manifest)?.labview {
+                Some(have) => log!("  labview = {have:?} kept (the file says {lv:?})"),
+                None => log!("  would set labview = {lv:?}"),
+            },
+            true => match project::set_labview_if_missing(&manifest, lv)? {
+                Some(have) if &have != lv => log!("  labview = {have:?} kept (the file says {lv:?})"),
+                Some(_) => {}
+                None => log!("  set labview = {lv:?}"),
+            },
+        }
+    }
+
+    for &i in &pinned {
+        let p = &vipc.packages[i];
+        if dry_run {
+            let into = match (group, exists) {
+                (Some(g), _) => group_label(g),
+                (None, true) => "the group declaring it, else [dependencies]".to_string(),
+                (None, false) => group_label(project::MAIN_GROUP),
+            };
+            log!("  would save {} = \"{}\" ({into})", p.name, p.version);
+            continue;
+        }
+        match project::save_dependency(&manifest, group, &p.name, &p.version)? {
+            project::Saved::Added { group } => log!("  saved {} = \"{}\" {}", p.name, p.version, group_label(&group)),
+            project::Saved::Updated { group, from } => {
+                log!("  updated {} {}: \"{from}\" -> \"{}\"", p.name, group_label(&group), p.version)
+            }
+            project::Saved::Unchanged { group } => {
+                log!("  {} = \"{}\" already in {}", p.name, p.version, group_label(&group))
+            }
+        }
+    }
+    let left: Vec<usize> = (0..vipc.packages.len()).filter(|i| !pinned.contains(i)).collect();
+    if !left.is_empty() {
+        log!("\nnot written, installed as dependencies of the packages above (--all pins them too):");
+        for &i in &left {
+            let p = &vipc.packages[i];
+            match by[i] {
+                Some(r) => log!("  {} {}  (via {})", p.name, p.version, vipc.packages[r].name),
+                None => log!("  {} {}", p.name, p.version),
+            }
+        }
+        log!("  the install resolves them again and may pick newer versions than the file lists");
+    }
+
+    let config = config::load()?;
+    if embedded > 0 {
+        log!("\n{}package cache, from {file_name}:", if dry_run { "would add to the " } else { "added to the " });
+        for p in vipc.packages.iter() {
+            let Some((member, bytes)) = &p.embedded else { continue };
+            if dry_run {
+                log!("  {} {}", p.name, p.version);
+                continue;
+            }
+            let source = format!("{}!{member}", file.display());
+            let (_, _, sha, had) = index::cache_add_bytes(&config.cache, &source, bytes)?;
+            log!("  {} {}  sha256:{}{}", p.name, p.version, &sha[..12], if had { " (already there)" } else { "" });
+        }
+    }
+
+    // Which packages no index has: the embedded ones are then only in this
+    // machine's cache, the others cannot be installed at all.
+    let project = match manifest.is_file() {
+        true => Some((manifest.clone(), project::read(&manifest)?)),
+        false => None,
+    };
+    let idx = match load_index(cli, project.as_ref()) {
+        Ok(idx) => idx,
+        Err(e) => {
+            wlog!("\ncould not read the package indexes to check availability: {e:#}");
+            return import_done(&vipc, dry_run, &file_name, &[]);
+        }
+    };
+    let hosted = |p: &vipm_interop::VipcPackage| {
+        idx.versions_of(&p.name).iter().any(|e| !index::is_local_url(&e.url) && e.version.raw == p.version)
+    };
+    let local_only: Vec<&vipm_interop::VipcPackage> =
+        vipc.packages.iter().filter(|p| p.embedded.is_some() && !hosted(p)).collect();
+    let missing: Vec<&vipm_interop::VipcPackage> = pinned
+        .iter()
+        .map(|&i| &vipc.packages[i])
+        .filter(|p| p.embedded.is_none() && !idx.versions_of(&p.name).iter().any(|e| e.version.raw == p.version))
+        .collect();
+    if !missing.is_empty() {
+        wlog!("\nnot on any index lvpm reads, nor in the cache; installing them will fail:");
+        for p in &missing {
+            wlog!("  {} {}", p.name, p.version);
+        }
+        wlog!("  add the index that has them under [sources], or `lvpm cache add` the .vip files");
+    }
+    import_done(&vipc, dry_run, &file_name, &local_only)
+}
+
+/// The closing note of `lvpm import`: packages only this machine's cache has.
+fn import_done(
+    vipc: &vipm_interop::Vipc,
+    dry_run: bool,
+    file_name: &str,
+    local_only: &[&vipm_interop::VipcPackage],
+) -> Result<()> {
+    if !local_only.is_empty() {
+        log!(
+            "\nnote: {} package(s) {} only in your local package cache: no index lvpm reads has these versions.",
+            local_only.len(),
+            if dry_run { "would be" } else { "are" }
+        );
+        for p in local_only {
+            log!("  {} {}", p.name, p.version);
+        }
+        log!(
+            "  lvpm.toml names them, but a teammate or CI runner can install them only after\n  \
+             `lvpm import {file_name}` there too (or once they are hosted on an index in [sources])."
+        );
+    }
+    if vipc.packages.is_empty() {
+        log!("\n{file_name} lists no packages");
+    }
+    match dry_run {
+        true => log!("\ndry run: nothing written"),
+        false => log!("\nnext: `lvpm install` installs them"),
+    }
+    Ok(())
 }
 
 /// Read a manifest file. A `vipm.toml` goes through the VIPM conversion; it

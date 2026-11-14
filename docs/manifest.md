@@ -384,6 +384,12 @@ the chosen manifest for subsequent installs and dependency-aware uninstalls.
 - **NIPM.** VIPM installs `[nipm.*]` packages through NI Package Manager.
   lvpm only reports them.
 
+### Importing a `.vipc`
+
+A `.vipc` (VI Package Configuration) is not read as a manifest: `lvpm import`
+writes its packages into an `lvpm.toml` once. See
+[compatability.md](compatability.md#importing-a-vipc).
+
 ### One file for both tools
 
 Keep the file as `vipm.toml` and point lvpm at it with `--manifest`: the
@@ -487,8 +493,8 @@ Tracked in [roadmap.md](roadmap.md#the-manifest-and-the-lockfile---wip):
 - **`[venv]` overrides**: `dir`, `vi-server-port`, `bitness`.
 - **`vipm.toml` conversion, remaining fields**: `labview-bitness` is checked
   against the selected target once `[venv] bitness` exists. Writing an
-  `lvpm.toml` from the converted result (a one-off migration command) is a
-  possible follow-up.
+  `lvpm.toml` from the converted result is a possible follow-up, as a
+  second input to `lvpm import` (which reads `.vipc` files today).
 - **Open decision: should lvpm discover `vipm.toml`?** Today it does not; a
   `vipm.toml` is converted only when named with `--manifest`. Options:
 
