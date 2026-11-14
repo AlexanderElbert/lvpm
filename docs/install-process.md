@@ -111,6 +111,10 @@ Linkfix's `clfn-wildcard` method now makes that repair itself (see
 works around the same issue differently: its hook unzips clean copies of its
 VIs over the installed ones. linkfix covers that one too.
 
+[package-notes.md](package-notes.md) has what we found about commonly used
+packages in a venv: whose hooks are needed, which can stay skipped, and which
+don't work yet.
+
 Hook failures are reported, never fatal: the files are installed either way,
 and an uninstall is never left half-done. After the hooks, a global `install`
 rebuilds the palettes and menus so a package's palette and Tools entries

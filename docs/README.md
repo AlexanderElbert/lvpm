@@ -13,6 +13,7 @@
 | [configuration.md](configuration.md) | Settings, environment variables and logs |
 | [ci-container.md](ci-container.md) | Running lvpm in NI's LabVIEW containers, headless mode |
 | [linux.md](linux.md) | What differs on Linux |
+| [package-notes.md](package-notes.md) | Commonly used packages in a venv: whose hooks are needed, which can stay skipped, which don't work yet |
 | [limitations.md](limitations.md) | Known limitations |
 
 ## Internals and design

@@ -20,6 +20,9 @@
   that drops palette files into the overlay is picked up at the next
   `lvpm launch`, not by a refresh. Uninstall hooks still never run in a venv,
   whose LabVIEW has to be closed before its files can be removed.
+- Some packages don't work in a venv yet (Panther Dashboard for DQMH), and
+  some need their PostInstall hook run by hand (AsciiDoc for LabVIEW).
+  [package-notes.md](package-notes.md) lists them.
 - `lvpm launch` checks install records, not file contents: a package VI
   edited or resaved since install is not detected.
 

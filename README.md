@@ -153,6 +153,7 @@ All commands and flags: [docs/commands.md](docs/commands.md).
 | [Configuration](docs/configuration.md) | Settings, environment variables, logs |
 | [CI in a container](docs/ci-container.md) | NI's Docker images, headless installs |
 | [Linux](docs/linux.md) | What differs on Linux |
+| [Package notes](docs/package-notes.md) | Commonly used packages in a venv: hooks needed, what doesn't work yet |
 | [Known limitations](docs/limitations.md) | What does not work yet |
 | [All documentation](docs/README.md) | Including design notes and internals |
 
