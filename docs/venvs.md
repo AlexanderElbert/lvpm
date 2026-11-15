@@ -85,6 +85,42 @@ resolves as `<vilib>/...` exactly as a globally installed one would. The VIs
 you write against it link portably, and `C:\Program Files` never changes.
 Needs LabVIEW 2024 Q1 or later.
 
+```mermaid
+flowchart LR
+    subgraph inst["LabVIEW installation · C:\Program Files\NI\LabVIEW 2026"]
+        i1["vi.lib\Utility\..."]
+    end
+    subgraph venv[".lv-venv\packages"]
+        v1["delacor_lib_dqmh\1\vi.lib\Delacor\DQMH\..."]
+        v2["oglib_error\1\vi.lib\_OpenG.lib\error\..."]
+    end
+    subgraph seen["What LabVIEW sees"]
+        s1["#60;vilib#62;\Utility\..."]
+        s2["#60;vilib#62;\Delacor\DQMH\..."]
+        s3["#60;vilib#62;\_OpenG.lib\error\..."]
+    end
+    i1 --> s1
+    v1 --> s2
+    v2 --> s3
+```
+
+The overlay only adds files; it never replaces one. For each path LabVIEW
+looks in its own installation first and in the venv's addons second:
+
+```mermaid
+flowchart TD
+    need["LabVIEW needs #60;vilib#62;\Delacor\DQMH\DQMH.lvlib"]
+    need --> q1{"In the installation?<br/>C:\Program Files\NI\LabVIEW 2026\vi.lib\..."}
+    q1 -- yes --> a1["The installation's copy loads.<br/>The venv's copy is ignored (shadowed)."]
+    q1 -- no --> q2{"In a venv addon?<br/>.lv-venv\packages\delacor_lib_dqmh\1\vi.lib\..."}
+    q2 -- yes --> a2["The venv's copy loads."]
+    q2 -- no --> a3["Missing: LabVIEW cannot find it."]
+```
+
+So a package that is also in the installation, from VIPM or an earlier
+global install, loads from there whatever version the venv holds. See
+below for the warning lvpm gives.
+
 Environments created with the old layout must be recreated: close their
 LabVIEW instance, then run `lvpm venv remove`, `lvpm venv create`, and
 `lvpm install`. Removing the venv also removes its installed packages and
@@ -98,8 +134,36 @@ Two things follow from LabVIEW reading an addon's contents at launch:
   is already open there.
 - The real installation always wins over the overlay: a package installed
   both globally and in the venv loads from the global copy, whatever its
-  version. Keep the target installation clean of what the venv provides.
+  version. Keep the target installation clean of what the venv provides
+  (see [below](#keeping-the-labview-installation-clean)).
   lvpm warns when it is not: after an install into the venv, at `lvpm launch`
   and in `lvpm venv status`, it names every venv package whose LabVIEW files
   the installation has too (from VIPM, `lvpm install --global` or a copy by
   hand) and how to remove that copy. The check takes milliseconds.
+
+## Keeping the LabVIEW installation clean
+
+A venv adds to the LabVIEW installation; it does not hide it. Everything in
+the installation's `vi.lib` is still there when LabVIEW runs on a venv, and
+that causes two problems:
+
+- **Shadowing.** A package in both places loads from the LabVIEW vi.lib installation, as
+  described above.
+- **Undeclared dependencies.** A project VI can link to a library that is
+  installed in LabVIEW but not listed in `lvpm.toml`. It loads on that
+  machine and breaks on a colleague's or in CI, where only what the manifest
+  lists is installed. lvpm cannot catch this: `lvpm launch` checks the venv
+  against the manifest, not against what the project's VIs use.
+
+So the LabVIEW installation should hold as few packages as possible:
+
+- **Libraries your code calls** (frameworks, OpenG, toolkits, anything a
+  project VI links to) go in each project's venv, not in LabVIEW.
+- **Editor tools you use in every project** (Quick Drop plugins, menu
+  add-ons, G-CLI) can stay in the installation, as long as no project VI
+  calls into them.
+
+To move an existing machine over, uninstall the libraries from LabVIEW (with
+VIPM, or `lvpm uninstall --global <pkg>` for ones lvpm installed), then run
+`lvpm install` in each project. `lvpm venv status` lists any venv package the
+installation still has a copy of.

@@ -21,9 +21,17 @@
 **lvpm** installs LabVIEW packages from the command line. It resolves `.vip`
 and `.ogp` packages by name from the public package directories, your own
 hosted indexes or local folders, downloads and verifies them, and unpacks
-them into a LabVIEW installation or into a project's own **venv**. A project
+them into a LabVIEW installation or into a project's own **[venv](docs/venvs.md)**. A project
 declares what it needs in `lvpm.toml`, so every developer and every CI job
 gets the same packages.
+
+**Venvs are new to LabVIEW.** Until now every package went into the one
+`vi.lib` that every project on the machine shares, so two projects needing
+different versions of a library meant two LabVIEW VMs or two
+machines. A venv gives each project its own packages, the way a Python
+virtualenv or `node_modules` does: they live beside the project, LabVIEW
+mounts them as an [LVAddons](https://labviewwiki.org/wiki/LVAddons) overlay
+(LabVIEW 2024 Q1 and later), and `C:\Program Files` never changes.
 
 ```console
 $ lvpm venv create --labview-version 2026
@@ -40,12 +48,13 @@ $ lvpm launch MyProject.lvproj
 
 ## Features
 
+- **Per-project dependencies, a first for LabVIEW.** A venv keeps a
+  project's packages beside it, mounted into LabVIEW as an LVAddons overlay.
+  `C:\Program Files` never changes, and two projects can use two versions
+  of the same library on one machine.
 - **Works with the packages that exist today.** Reads VIPM's `.vip` and
   OpenG's `.ogp` formats and the public package directories NI and JKI
   host, plus any index or folder of `.vip` files you add.
-- **Per-project dependencies.** A venv keeps a project's packages beside it,
-  mounted into LabVIEW as an LVAddons overlay. `C:\Program Files` never
-  changes, and two projects can use two versions of the same library.
 - **A manifest you commit.** `lvpm.toml` lists dependencies with exact pins,
   `>=` floors or `*`, optional dependency groups (`test`, `ci`, ...), extra
   package indexes, and per-package hook and relink settings.
@@ -122,7 +131,7 @@ $ lvpm launch MyProject.lvproj    # a LabVIEW that sees the venv
 ```
 
 Commit `lvpm.toml`; the venv ignores itself in git. Any `lvpm` command run
-inside the project uses its venv, with no activation step.
+inside the project folder uses its venv, with no activation step.
 
 ## Commands
 
@@ -159,12 +168,12 @@ All commands and flags: [docs/commands.md](docs/commands.md).
 
 ## Why lvpm
 
-LabVIEW packaging was open before it was closed. The OpenG Package Tools
-(2002–2005) designed and documented the package format, the package
-directories and install-time script VIs; VIPM descends from that design and
-is closed source. lvpm goes back to the open model and finishes it, with the
-same formats, so today's packages and directories work as they are. More in
-[docs/architecture.md](docs/architecture.md).
+lvpm is open source so the LabVIEW community can develop and fix the tools
+it depends on. If a feature does not work the way it should, we can improve it together.
+
+It uses the package format the OpenG Package Tools first defined, which VIPM also builds on, so the `.vip` and `.ogp` packages and the
+package directories in use today work with lvpm unchanged.
+[docs/architecture.md](docs/architecture.md) has more.
 
 ## Status
 

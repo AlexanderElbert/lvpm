@@ -2,21 +2,20 @@
 
 ## Lineage
 
-LabVIEW packaging was open before it was closed. The **OpenG Package Tools**
-(2002–2005) designed and documented all of it: the zip-with-a-`spec`
-package, the INI package directory, `Target Dir` tokens, file groups, replace
-modes, install-time script VIs, the installed-package database, dependency
-resolution, and a per-project "development system configuration" you could
-export and re-import. VIPM descends from that design and is closed source;
-the design, its documents and its source are still public at
-<https://ogpm.sourceforge.net/>.
+The package format lvpm reads comes from the **OpenG Package Tools**
+(2002–2005). They defined the package (a zip with a `spec` file), the INI
+package directory, `Target Dir` tokens, file groups, replace modes,
+install-time script VIs, the installed-package database, dependency
+resolution, and a per-project "development system configuration" that could
+be exported and imported again. VIPM builds on the same design. The OpenG
+documents and source are still online at <https://ogpm.sourceforge.net/>.
 
-lvpm goes back to that model and finishes it: same formats, so today's `.vip`
-and `.ogp` packages and the public `.ogpd` / `.vipr` directories work as-is,
-with link preparation in Rust and LabVIEW-side work (running hook VIs and
-optional load/save relinking) over VI Server, a documented TCP protocol.
-[ogpm-model.md](ogpm-model.md) is the reference and the term-by-term map from
-OGPT to lvpm.
+lvpm uses the same formats, so today's `.vip` and `.ogp` packages and the
+public `.ogpd` / `.vipr` directories work with it unchanged. Link repair is
+done in Rust on the files themselves. Work that needs LabVIEW, running hook
+VIs and the optional load-and-save relink, goes over VI Server; its TCP
+protocol is described in [vi-server-protocol.md](vi-server-protocol.md).
+[ogpm-model.md](ogpm-model.md) maps each OpenG term to its lvpm equivalent.
 
 ## Source layout
 
