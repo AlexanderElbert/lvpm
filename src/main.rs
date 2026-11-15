@@ -2045,11 +2045,11 @@ fn cmd_install(
     // stopping here would leave what was just copied without linkfix, its
     // manifest entry and its hooks.
     let (records, unreadable) = install::list_installed_lenient(&store)?;
-    for (path, e) in &unreadable {
+    // The error names the file already.
+    for (_, e) in &unreadable {
         wlog!(
-            "\nwarning: cannot read the installation record {}: {e:#}\n      \
-             whether that package's post-install hook is owed is unknown; uninstall it with the lvpm that installed it",
-            path.display()
+            "\nwarning: {e:#}\n      \
+             whether that package's post-install hook is owed is unknown; uninstall it with the lvpm that installed it"
         );
     }
     for m in records {
@@ -2665,6 +2665,12 @@ fn cmd_venv(cli: &Cli, sub: &VenvCmd) -> Result<()> {
             log!("  VI Server port {}", v.port);
             log!("  log            {}", v.log_path().display());
             log!("\nnext: {install_hint} into it, `lvpm launch` starts LabVIEW on it");
+            Ok(())
+        }
+        // A project with no venv yet is an answer here, not an error: the
+        // refusal `find` gives is for commands that would install somewhere.
+        VenvCmd::Status if cli.project.is_none() && matches!(venv::probe(&cwd)?, venv::Found::ManifestOnly(_)) => {
+            log!("no venv for the project at or above {} yet — `lvpm venv create` makes one", cwd.display());
             Ok(())
         }
         VenvCmd::Status => match venv::find(cli.project.as_deref(), &cwd)? {

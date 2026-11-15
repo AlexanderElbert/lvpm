@@ -146,13 +146,16 @@ pub fn list_installed(roots: &Roots) -> Result<Vec<Manifest>> {
     }
 }
 
+/// An install record that could not be read, and why.
+pub type Unreadable = (PathBuf, anyhow::Error);
+
 /// Every record that reads, and each one that does not with the reason. For
 /// a command that only looks the records over (the install's sweep for owed
 /// hooks): one record from an older lvpm, or a damaged one, belongs to some
 /// other package and must not stop it. A command that acts on a record
 /// (`uninstall`, `list`, `run-hooks --all`) uses [`list_installed`], which
 /// refuses instead.
-pub fn list_installed_lenient(roots: &Roots) -> Result<(Vec<Manifest>, Vec<(PathBuf, anyhow::Error)>)> {
+pub fn list_installed_lenient(roots: &Roots) -> Result<(Vec<Manifest>, Vec<Unreadable>)> {
     let dir = roots.store_dir();
     if !dir.exists() {
         return Ok((Vec::new(), Vec::new()));
