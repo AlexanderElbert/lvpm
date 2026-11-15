@@ -389,16 +389,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lvpm-logging-test-{}", std::process::id()));
         let path = dir.join("sub").join("test.log");
         let mut s = empty();
-        record(&mut s, "early
-".into());
+        record(&mut s, "early\n".into());
         assert_eq!(s.pending.len(), 1);
         attach_to(&mut s, &path);
         assert!(s.pending.is_empty());
-        record(&mut s, "later
-".into());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "early
-later
-");
+        record(&mut s, "later\n".into());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "early\nlater\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -412,11 +408,9 @@ later
         s.path = Some(path.clone());
         // A file opened for reading only: every write to it fails.
         s.file = Some(File::open(&path).unwrap());
-        record(&mut s, "one
-".into());
+        record(&mut s, "one\n".into());
         assert!(s.failed && s.file.is_none());
-        record(&mut s, "two
-".into());
+        record(&mut s, "two\n".into());
         assert!(s.pending.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
