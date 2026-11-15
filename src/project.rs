@@ -544,6 +544,75 @@ pub fn remove_dependency(path: &Path, name: &str) -> Result<Vec<String>> {
     Ok(declared.into_iter().map(|(g, _)| g).collect())
 }
 
+/// Set `[project] <key>` (`labview`, `name`, `version`) in `path` unless it
+/// is set already; returns the value already there, if any, which is left
+/// alone.
+pub fn set_project_if_missing(path: &Path, key: &str, value: &str) -> Result<Option<String>> {
+    let mut edit = Edit::open(path)?;
+    let root = edit.doc.as_table_mut();
+    if !root.contains_key("project") {
+        root.insert("project", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let project = root["project"]
+        .as_table_like_mut()
+        .with_context(|| format!("{}: project is not a table", path.display()))?;
+    if let Some(existing) = project.get(key) {
+        return Ok(Some(existing.as_str().unwrap_or_default().to_string()));
+    }
+    project.insert(key, toml_edit::value(value));
+    edit.write()?;
+    Ok(None)
+}
+
+/// Write `name = value` into `[nipm.dependencies]`, replacing an entry of
+/// the same name. Returns whether anything changed. The value is copied as
+/// written (a version string or a `{ version, feed }` table).
+pub fn save_nipm(path: &Path, name: &str, value: &toml::Value) -> Result<bool> {
+    let mut edit = Edit::open(path)?;
+    let new: toml_edit::Value = value
+        .to_string()
+        .parse()
+        .with_context(|| format!("[nipm.dependencies] {name}: cannot copy {value}"))?;
+    let root = edit.doc.as_table_mut();
+    if !root.contains_key("nipm") {
+        let mut nipm = toml_edit::Table::new();
+        nipm.set_implicit(true);
+        root.insert("nipm", toml_edit::Item::Table(nipm));
+    }
+    let nipm = root["nipm"]
+        .as_table_like_mut()
+        .with_context(|| format!("{}: nipm is not a table", path.display()))?;
+    if nipm.get("dependencies").is_none() {
+        nipm.insert("dependencies", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let deps = nipm
+        .get_mut("dependencies")
+        .and_then(|d| d.as_table_like_mut())
+        .with_context(|| format!("{}: nipm.dependencies is not a table", path.display()))?;
+    let key = deps.iter().map(|(k, _)| k.to_string()).find(|k| k.eq_ignore_ascii_case(name));
+    let same = key
+        .as_deref()
+        .and_then(|k| deps.get(k))
+        .and_then(|i| i.as_value())
+        .is_some_and(|v| v.to_string().trim() == new.to_string().trim());
+    if same {
+        return Ok(false);
+    }
+    deps.insert(key.as_deref().unwrap_or(name), toml_edit::Item::Value(new));
+    edit.write()?;
+    Ok(true)
+}
+
+/// The skeleton `lvpm venv create` and `lvpm import` write when a project
+/// has no manifest yet.
+pub fn skeleton(name: &str, labview: Option<&str>) -> String {
+    let quote = |s: &str| toml::Value::String(s.to_string()).to_string();
+    match labview {
+        Some(lv) => format!("[project]\nname = {}\nlabview = {}\n\n[dependencies]\n", quote(name), quote(lv)),
+        None => format!("[project]\nname = {}\n\n[dependencies]\n", quote(name)),
+    }
+}
+
 /// A manifest open for editing.
 struct Edit {
     path: PathBuf,
@@ -1065,6 +1134,46 @@ pkg_a = "*"
         assert!(!after.to_lowercase().contains("caraya"), "{after}");
         assert!(after.contains("oglib_error = \"6.0.1\"  # pinned for a reason"), "{after}");
         assert!(after.contains("vi_tester"), "{after}");
+    }
+
+    #[test]
+    fn project_keys_are_set_only_when_missing() {
+        let after = edited("# top\n[project]\nname = \"x\"\n", |p| {
+            assert_eq!(set_project_if_missing(p, "labview", "2020")?, None);
+            assert_eq!(set_project_if_missing(p, "labview", "2026")?, Some("2020".into()));
+            assert_eq!(set_project_if_missing(p, "name", "y")?, Some("x".into()));
+            Ok(())
+        });
+        let p = parse(&after).unwrap();
+        assert_eq!(p.labview.as_deref(), Some("2020"));
+        assert_eq!(p.name.as_deref(), Some("x"));
+        assert!(after.starts_with("# top\n"), "{after}");
+        let after = edited("[dependencies]\n", |p| set_project_if_missing(p, "labview", "2024").map(drop));
+        assert_eq!(parse(&after).unwrap().labview.as_deref(), Some("2024"));
+    }
+
+    #[test]
+    fn nipm_entries_are_copied_as_written() {
+        let table: toml::Table = toml::from_str("a = \"24.0\"\nb = { version = \"24.5.0\", feed = \"ni-daq\" }\n").unwrap();
+        let after = edited("[project]\nname = \"x\"\n", |p| {
+            assert!(save_nipm(p, "ni-visa", &table["a"])?);
+            assert!(save_nipm(p, "ni-daqmx", &table["b"])?);
+            assert!(!save_nipm(p, "NI-VISA", &table["a"])?, "same value, any case: unchanged");
+            Ok(())
+        });
+        assert_eq!(parse(&after).unwrap().nipm, ["ni-visa", "ni-daqmx"]);
+        assert!(after.contains("[nipm.dependencies]"), "{after}");
+        assert!(!after.contains("[nipm]\n"), "no empty [nipm] header: {after}");
+        let back: toml::Table = toml::from_str(&after).unwrap();
+        assert_eq!(back["nipm"]["dependencies"]["ni-daqmx"], table["b"]);
+    }
+
+    #[test]
+    fn the_skeleton_quotes_what_it_is_given() {
+        let p = parse(&skeleton("my \"odd\" project", Some("2025"))).unwrap();
+        assert_eq!(p.name.as_deref(), Some("my \"odd\" project"));
+        assert_eq!(p.labview.as_deref(), Some("2025"));
+        assert_eq!(parse(&skeleton("x", None)).unwrap().labview, None);
     }
 
     #[test]

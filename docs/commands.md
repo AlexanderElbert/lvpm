@@ -21,6 +21,7 @@ and what changes before it is called stable, are in [cli.md](cli.md).
 | `lvpm launch [<lvproj>]`                             | Check the venv against the manifest, then start a LabVIEW on it (see [venvs.md](venvs.md#launching-labview))                                 |
 | `lvpm config get` / `set`                            | Read or change user-level settings (see [configuration.md](configuration.md))                                                                |
 | `lvpm cache add <path>`                              | Import package archives into the shared cache (see [package-sources.md](package-sources.md#the-cache))                                      |
+| `lvpm import <file>`                                 | Write VIPM's `vipm.toml` or a `.vipc` into `lvpm.toml` once (see [compatibility.md](compatibility.md))                                      |
 | `lvpm vi-probe` / `vi-run` / `vi-save` / `app-probe` | VI Server primitives, for diagnosis (see [install-process.md](install-process.md#vi-server))                                                 |
 
 ## Flags for every command

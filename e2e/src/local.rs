@@ -65,7 +65,7 @@ pub fn trials() -> Vec<Trial> {
         ("uninstall: project dependencies and their dependencies are kept", uninstall_project_dependencies),
         ("install and uninstall by name edit lvpm.toml", install_saves_to_manifest),
         ("uninstall: old bindings require recreation", uninstall_old_binding),
-        ("uninstall: explicit VIPM manifest protects project dependencies", uninstall_vipm_manifest),
+        ("import: a vipm.toml becomes the lvpm.toml that protects its dependencies", import_vipm_manifest),
         (
             "venv install with relink in a LabVIEW started with -pref",
             venv_install,
@@ -505,7 +505,7 @@ fn install_saves_to_manifest() -> Check {
         let manifest = std::fs::read_to_string(&path).map_err(fail)?;
         ensure(manifest.contains("[dependencies.test]"), || format!("no test group:\n{manifest}"))?;
         let removed = ok(&venv(), &["uninstall", "lvpm_e2e_root", "--with-deps"])?;
-        contains(&removed, "removed lvpm_e2e_root from lvpm.toml [dependencies]")?;
+        contains(&removed, &regex::escape("removed lvpm_e2e_root from lvpm.toml [dependencies]"))?;
         let manifest = std::fs::read_to_string(&path).map_err(fail)?;
         ensure(!manifest.contains("lvpm_e2e_root"), || format!("still declared:\n{manifest}"))?;
         absent(&record("lvpm_e2e_root")?)?;
@@ -539,7 +539,7 @@ fn uninstall_old_binding() -> Check {
     ok(&venv(), &["uninstall", "--all"]).map(drop)
 }
 
-fn uninstall_vipm_manifest() -> Check {
+fn import_vipm_manifest() -> Check {
     let dir = env().work.join("vipm-venv");
     std::fs::create_dir_all(&dir).map_err(fail)?;
     std::fs::write(dir.join("vipm.toml"),
@@ -547,11 +547,17 @@ fn uninstall_vipm_manifest() -> Check {
          [dependencies]\nlvpm_e2e_private = \"1.0.0.1\"\n").map_err(fail)?;
     std::fs::write(dir.join("sources.toml"),
         "[sources]\ndefaults = false\n[dependencies]\nlvpm_e2e_root = \"*\"\n").map_err(fail)?;
-    ok(&dir, &["venv", "create", "--manifest", "vipm.toml"])?;
+    // A vipm.toml is not a manifest lvpm reads; it comes in through import.
+    let refused = lvpm(&dir, &["venv", "create", "--manifest", "vipm.toml"]).try_failure().map_err(fail)?;
+    contains(&refused, "lvpm import")?;
+    let imported = ok(&dir, &["--project", ".", "import", "vipm.toml"])?;
+    contains(&imported, &regex::escape("saved lvpm_e2e_private = \"1.0.0.1\" [dependencies]"))?;
+    contains(&imported, "set labview = \"2026\"")?;
+    ok(&dir, &["venv", "create"])?;
     ok(&dir, &["install", "--manifest", "sources.toml", "--no-relink"])?;
     let result = ok(&dir, &["uninstall", "lvpm_e2e_root", "--with-deps"])?;
-    contains(&result, "keeping lvpm_e2e_private: declared in vipm.toml")?;
-    contains(&result, "keeping lvpm_e2e_shared: required by a package declared in vipm.toml")?;
+    contains(&result, "keeping lvpm_e2e_private: declared in lvpm.toml")?;
+    contains(&result, "keeping lvpm_e2e_shared: required by a package declared in lvpm.toml")?;
     let location = stdout(&ok(&dir, &["config", "get", "venv.dir"])?);
     let records = dir.join(location.trim()).join("installed");
     absent(&records.join("lvpm_e2e_root.json"))?;

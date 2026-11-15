@@ -39,7 +39,7 @@ protocol is described in [vi-server-protocol.md](vi-server-protocol.md).
 | `refresh.rs`                   | Rebuild palettes and menus through LabVIEW's own shipping VIs                                                           |
 | `viserver.rs`                  | The VI Server TCP protocol: connection, methods, flattened data (see [vi-server-protocol.md](vi-server-protocol.md))   |
 | `version.rs`                   | Package version ordering: OGPT `version-release`, VIPM's four-part form; not semver                                     |
-| `vipm_interop.rs`              | Reading VIPM's `vipm.toml` as an lvpm manifest                                                                          |
+| `vipm_interop.rs`              | Reading VIPM's `vipm.toml` and `.vipc` files for `lvpm import`                                                          |
 | `src/lv-src/relink-package.vi` | The relink VI, shipped next to the executable; `build.rs` records its hash (LabVIEW 2020)                               |
 | `scripts/install.ps1`          | Download, verify and install the latest release (the MSI, or the zip with `-Portable`)                                 |
 | `scripts/install.sh`           | The same for Linux x64, from the static tarball                                                                         |

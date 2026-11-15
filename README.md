@@ -146,6 +146,7 @@ inside the project folder uses its venv, with no activation step.
 | `lvpm launch [<lvproj>]` | Check the venv against the manifest and start LabVIEW on it |
 | `lvpm linkfix` / `relink` / `run-hooks` / `refresh` | Rerun one step of an install |
 | `lvpm config` / `cache add` | Settings and the package cache |
+| `lvpm import <file>` | Write VIPM's `vipm.toml` or a `.vipc` into `lvpm.toml` once |
 
 All commands and flags: [docs/commands.md](docs/commands.md).
 
@@ -155,7 +156,8 @@ All commands and flags: [docs/commands.md](docs/commands.md).
 | --- | --- |
 | [Installation](docs/installation.md) | Install script, manual install, building from source |
 | [Commands](docs/commands.md) | Every command and flag |
-| [The manifest (`lvpm.toml`)](docs/manifest.md) | Dependencies, groups, sources, hooks and relink, `vipm.toml` |
+| [The manifest (`lvpm.toml`)](docs/manifest.md) | Dependencies, groups, sources, hooks and relink |
+| [VIPM's files](docs/compatibility.md) | Importing a `vipm.toml` or a `.vipc` with `lvpm import` |
 | [Venvs](docs/venvs.md) | Per-project dependencies and `lvpm launch` |
 | [What an install does](docs/install-process.md) | Linkfix, relinking, install hooks, VI Server |
 | [Package sources and cache](docs/package-sources.md) | Public directories, own indexes, local folders |

@@ -191,6 +191,23 @@ impl Cache {
         Ok(())
     }
 
+    /// Record a package that came out of another file (a `.vipc`) rather than
+    /// a file of its own, as an import: `source_ref` names where it came
+    /// from, e.g. `C:\proj\deps.vipc!pkg-1.0.vip`. There is no file to stat,
+    /// so no `local_files` shortcut. Re-importing the same member replaces
+    /// the row. The caller must store the blob first.
+    pub fn record_embedded(&self, source_ref: &str, entry: &LocalEntry, sha256: &str, md5: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO packages (name, version, sha256, md5, source_kind, source_ref, display_name, entry, added_at)
+             VALUES (?1, ?2, ?3, ?4, 'local-add-cache', ?5, ?6, ?7, ?8)
+             ON CONFLICT(name, version, source_ref) DO UPDATE SET
+             sha256=excluded.sha256, md5=excluded.md5, display_name=excluded.display_name,
+             entry=excluded.entry, added_at=excluded.added_at",
+            params![entry.name, entry.version, sha256, md5, source_ref, entry.display_name, serde_json::to_string(entry)?, now()],
+        )?;
+        Ok(())
+    }
+
     /// Load explicitly imported metadata for resolution, without reading blob bytes.
     /// Remote downloads are excluded: their availability is still decided by feeds.
     pub fn imported_packages(&self) -> Result<Vec<CachedPackage>> {

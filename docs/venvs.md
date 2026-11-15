@@ -22,7 +22,7 @@ that exists is updated in place, in its group; `--group dev` saves into
 `[dependencies.dev]` instead. `lvpm uninstall <name>` takes the package out
 of every group declaring it. Comments and formatting elsewhere in the file
 stay as written. `--no-save` leaves the manifest alone for either command,
-`uninstall --all` never edits it, and a `vipm.toml` is never written.
+and `uninstall --all` never edits it.
 
 - `lvpm venv create` makes `.lv-venv/` beside `lvpm.toml` by default and binds it to a
   LabVIEW version: `--labview-version`, else the manifest's `labview`.

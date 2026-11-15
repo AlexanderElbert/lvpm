@@ -243,6 +243,20 @@ pub fn cache_add(cache_dir: &Path, source: &Path, refresh: bool) -> Result<Vec<I
     Ok(imports)
 }
 
+/// Import package bytes carried inside another file (a `.vipc`'s `Included`
+/// packages) into the cache, as `cache add` does for a file of its own, so
+/// the resolver finds them like any imported package. Returns the package's
+/// name, version and SHA-256, and whether those bytes were stored already.
+pub fn cache_add_bytes(cache_dir: &Path, source_ref: &str, bytes: &[u8]) -> Result<(String, String, String, bool)> {
+    let entry = entry_from_bytes(Path::new(source_ref), bytes).with_context(|| format!("importing {source_ref}"))?;
+    let cache = Cache::open(cache_dir)?;
+    let sha = crate::cache::sha256_hex(bytes);
+    let had = cache.load(&sha)?.is_some();
+    let sha256 = cache.store(bytes)?;
+    cache.record_embedded(source_ref, &LocalEntry::from(&entry), &sha256, &md5_hex(bytes))?;
+    Ok((entry.name, entry.version.to_string(), sha256, had))
+}
+
 /// Load public indexes, global local package folders, and hosted manifest sources.
 pub fn load(
     cache_dir: &Path,
