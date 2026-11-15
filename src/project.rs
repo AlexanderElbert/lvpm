@@ -346,7 +346,7 @@ pub fn parse(text: &str) -> Result<Project> {
     }
     for (name, value) in f.dependencies {
         match value {
-            toml::Value::Table(t) if !is_dependency_table(&t) => {
+            toml::Value::Table(t) if !t.keys().any(|k| DEPENDENCY_KEYS.contains(&k.as_str())) => {
                 let label = format!("[dependencies.{name}]");
                 if name == MAIN_GROUP {
                     bail!("{label}: `{MAIN_GROUP}` is the name of [dependencies]; pick another");
@@ -410,9 +410,12 @@ pub fn parse(text: &str) -> Result<Project> {
 /// The keys a dependency table may hold.
 const DEPENDENCY_KEYS: [&str; 3] = ["version", "hooks", "relink"];
 
-/// A table under `[dependencies]` is one dependency when it has a `version`
-/// and nothing but [`DEPENDENCY_KEYS`]; any other table is a group. (So a
-/// group cannot consist of packages named `version`, `hooks` and `relink` alone.)
+/// A table under `[dependencies]` that holds any of [`DEPENDENCY_KEYS`] is
+/// meant as one dependency, so a typo such as `{ version = "1", hook = "run" }`
+/// is an error from [`dependency`] rather than a silent group; a table with
+/// none of them is a group. (So a group cannot contain a package named
+/// `version`, `hooks` or `relink`.) Inside [`dependency`] a table is valid
+/// when it has a `version` and nothing but those keys.
 fn is_dependency_table(t: &toml::Table) -> bool {
     t.contains_key("version") && t.keys().all(|k| DEPENDENCY_KEYS.contains(&k.as_str()))
 }
@@ -449,7 +452,7 @@ fn dependency(label: &str, name: &str, value: toml::Value) -> Result<Dependency>
             Ok(Dependency { constraint: c, hooks, relink })
         }
         toml::Value::Table(t) => bail!(
-            "{}: a dependency table takes {} and needs version; got {}",
+            "{}: a dependency table takes only {} and needs version; got {}",
             at(),
             DEPENDENCY_KEYS.join(", "),
             t.keys().cloned().collect::<Vec<_>>().join(", ")
@@ -986,6 +989,39 @@ oglib_array = "6.0.1.20"
             parse("[dependencies]\nx = { version = \"1\", hooks = \"run\" }\n[dependencies.t]\nx = { version = \"1\", hooks = \"skip\" }\n").is_err(),
             "groups disagree"
         );
+    }
+
+    #[test]
+    fn a_table_that_looks_like_a_dependency_is_not_read_as_a_group() {
+        for (text, got) in [
+            ("foo = { version = \"1\", hook = \"run\" }", "got version, hook"),
+            ("foo = { hooks = \"skip\" }", "got hooks"),
+            ("foo = { relink = true }", "got relink"),
+        ] {
+            let err = parse(&format!("[dependencies]
+{text}
+")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("[dependencies] foo"), "{msg}");
+            assert!(msg.contains("takes only version, hooks, relink and needs version"), "{msg}");
+            assert!(msg.contains(got), "{msg}");
+        }
+        assert_eq!(
+            parse("[dependencies]
+foo = { version = \"1\", hook = \"run\" }
+").unwrap_err().to_string(),
+            "[dependencies] foo: a dependency table takes only version, hooks, relink and needs version; got version, hook"
+        );
+        let p = parse("[dependencies.test]
+oglib_array = \"6.0.1.20\"
+jki_lib_caraya = { version = \"*\", hooks = \"run\" }
+
+[dependencies.ci]
+include-groups = [\"test\"]
+").unwrap();
+        assert!(p.dependencies.is_empty());
+        assert_eq!(p.groups.len(), 2);
+        assert_eq!(p.groups[1].1.include, ["test"]);
     }
 
     #[test]

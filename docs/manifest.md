@@ -165,10 +165,13 @@ looks the methods up by name again. VIPM does this load and save for every
 package by default (its "mass compile after install"), so such a package
 works there by accident.
 
-A table under `[dependencies]` is read as a dependency when its keys are
-`version` and, optionally, `hooks` and `relink`. Any other table is a
-[group](#named-dependency-groups). So a group cannot hold only packages named
-`version`, `hooks` and `relink`.
+A table under `[dependencies]` that holds any of `version`, `hooks` or
+`relink` is read as a dependency, and must then have `version` and no keys
+other than those three. A misspelt key (`hook = "run"`) or a missing
+`version` is an error naming the dependency and listing the keys it got,
+rather than a quiet group. A table with none of the three keys is a
+[group](#named-dependency-groups). So a group cannot hold a package named
+`version`, `hooks` or `relink`.
 
 ### How the manifest resolves
 
