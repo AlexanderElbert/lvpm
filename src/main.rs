@@ -1526,6 +1526,41 @@ enum InstallAction {
     KeepNewer(String),
 }
 
+/// What `install <pkg>` on a venv does to the manifest.
+#[derive(Debug, PartialEq)]
+enum SaveEntry {
+    /// Write `name = "version"`.
+    Save { name: String, version: String },
+    /// Leave it alone: the newer `installed` version was kept, and what
+    /// would be written does not allow it.
+    Kept { name: String, installed: String, resolved: String },
+}
+
+/// What a package named on a venv is saved as: the version asked for
+/// (`name@1.2.3`, `name@>=1.2`), else the one resolved, under the index's
+/// spelling of the name. Nothing is saved that the venv does not hold: when
+/// a newer installed version was kept, the entry is written only if it
+/// allows that version (`name@>=1.2` does, an exact version does not).
+fn save_entry_for(package: &str, plan: &[index::Entry], actions: &[InstallAction]) -> Option<SaveEntry> {
+    let (name, asked) = match package.split_once('@') {
+        Some((n, v)) => (n, Some(v)),
+        None => (package, None),
+    };
+    let i = plan.iter().position(|e| e.name.eq_ignore_ascii_case(name))?;
+    let e = &plan[i];
+    let version = asked.map_or_else(|| e.version.to_string(), str::to_string);
+    if let Some(InstallAction::KeepNewer(installed)) = actions.get(i)
+        && !project::Constraint::parse(&version).is_ok_and(|c| c.allows(&Version::parse(installed)))
+    {
+        return Some(SaveEntry::Kept {
+            name: e.name.clone(),
+            installed: installed.clone(),
+            resolved: e.version.to_string(),
+        });
+    }
+    Some(SaveEntry::Save { name: e.name.clone(), version })
+}
+
 fn install_action(roots: &Roots, e: &index::Entry, allow_downgrade: bool) -> Result<InstallAction> {
     if !install::is_installed(roots, &e.name) {
         return Ok(InstallAction::Install);
@@ -1658,19 +1693,21 @@ fn cmd_install(
 
     let plan = resolution.plan;
 
-    // What a package named on a venv is saved as: the version asked for
-    // (`name@1.2.3`, `name@>=1.2`), else the one resolved, under the index's
-    // spelling of the name.
-    let save_entry: Option<(String, String)> = match (package, &venv) {
-        (Some(p), Some(_)) if !save.no_save => {
-            let (name, asked) = match p.split_once('@') {
-                Some((n, v)) => (n, Some(v)),
-                None => (p, None),
+    // What the install does with each package of the plan, settled once:
+    // the fetch below and the manifest entry both follow from it.
+    let actions: Vec<InstallAction> = plan
+        .iter()
+        .map(|e| {
+            let roots = match &venv {
+                Some(v) => v.roots_for_pkg(&e.name)?,
+                None => store.clone(),
             };
-            plan.iter()
-                .find(|e| e.name.eq_ignore_ascii_case(name))
-                .map(|e| (e.name.clone(), asked.map_or_else(|| e.version.to_string(), str::to_string)))
-        }
+            install_action(&roots, e, allow_downgrade)
+        })
+        .collect::<Result<_>>()?;
+
+    let save_entry: Option<SaveEntry> = match (package, &venv) {
+        (Some(p), Some(_)) if !save.no_save => save_entry_for(p, &plan, &actions),
         (Some(_), None) if save.group.is_some() => {
             elog!("note: --group only applies on a venv; nothing is saved to a manifest here");
             None
@@ -1712,15 +1749,7 @@ fn cmd_install(
     {
         let wanted: Vec<&index::Entry> = plan
             .iter()
-            .map(|e| {
-                let roots = match &venv {
-                    Some(v) => v.roots_for_pkg(&e.name)?,
-                    None => store.clone(),
-                };
-                Ok((e, install_action(&roots, e, allow_downgrade)?))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
+            .zip(&actions)
             .filter(|(_, a)| matches!(a, InstallAction::Install))
             .map(|(e, _)| e)
             .collect();
@@ -2005,8 +2034,17 @@ fn cmd_install(
     // The files are installed: a package named on a venv goes into its
     // manifest now, before LabVIEW gets involved, so a relink or hook that
     // fails later does not leave the venv holding an undeclared package.
-    if let (Some((name, version)), Some(v)) = (&save_entry, &venv) {
-        save_to_manifest(v, save.group.as_deref(), name, version, dry_run);
+    match (&save_entry, &venv) {
+        (Some(SaveEntry::Save { name, version }), Some(v)) => {
+            save_to_manifest(v, save.group.as_deref(), name, version, dry_run)
+        }
+        // The manifest never names a version the venv does not hold.
+        (Some(SaveEntry::Kept { name, installed, resolved }), Some(v)) => log!(
+            "
+{} not changed: {name} {installed} stays installed (`--allow-downgrade` installs {resolved})",
+            v.manifest_path().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| "the manifest".into())
+        ),
+        _ => {}
     }
 
     // Relinking and the PostInstall hooks are the second phase, and both need
@@ -3228,6 +3266,42 @@ mod tests {
 
         assert!(!policy(HookMode::Never, false, false).allows("http"), "--no-hooks wins");
         assert!(policy(HookMode::Always, true, false).allows("gcli"), "--hooks wins");
+    }
+
+    #[test]
+    fn a_named_install_saves_nothing_the_venv_does_not_hold() {
+        let entry = |name: &str, version: &str| index::Entry {
+            name: name.into(),
+            version: Version::parse(version),
+            url: String::new(),
+            md5: None,
+            display_name: None,
+            requires: Vec::new(),
+            lv_min: None,
+        };
+        let plan = [entry("dep", "3.0"), entry("Foo", "1.0")];
+        let save = |version: &str| Some(SaveEntry::Save { name: "Foo".into(), version: version.into() });
+        let kept =
+            || Some(SaveEntry::Kept { name: "Foo".into(), installed: "2.0".into(), resolved: "1.0".into() });
+
+        // Installed or already there: the version asked for, else the one
+        // resolved, under the index's spelling of the name.
+        for action in [InstallAction::Install, InstallAction::Same] {
+            let actions = [InstallAction::Install, action];
+            assert_eq!(save_entry_for("foo", &plan, &actions), save("1.0"));
+            assert_eq!(save_entry_for("foo@1.0", &plan, &actions), save("1.0"));
+            assert_eq!(save_entry_for("foo@>=0.5", &plan, &actions), save(">=0.5"));
+        }
+
+        // A newer installed version was kept: an exact entry would name a
+        // version the venv does not hold; a floor that allows it is fine.
+        let actions = [InstallAction::Install, InstallAction::KeepNewer("2.0".into())];
+        assert_eq!(save_entry_for("foo", &plan, &actions), kept());
+        assert_eq!(save_entry_for("foo@1.0", &plan, &actions), kept());
+        assert_eq!(save_entry_for("foo@>=0.5", &plan, &actions), save(">=0.5"));
+        assert_eq!(save_entry_for("foo@*", &plan, &actions), save("*"));
+
+        assert_eq!(save_entry_for("absent", &plan, &actions), None);
     }
 
     #[test]
