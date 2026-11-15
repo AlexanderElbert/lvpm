@@ -21,7 +21,12 @@ installers = ["msi"]
 # Relink Package.vi ships next to the executable rather than inside it: an
 # unsigned exe that writes a blob out and hands it to another process looks
 # like a dropper to Microsoft Defender. lvpm looks for it beside itself.
-include = ["src/lv-src/relink-package.vi"]
+#
+# THIRD-PARTY-LICENSES.txt carries the notices of the crates built into lvpm,
+# which their licenses ask a binary distribution to include; lvpm's own
+# LICENSE-* files dist adds by itself. Regenerate it with cargo-about (see
+# about.toml); build.yml fails while it is stale.
+include = ["src/lv-src/relink-package.vi", "THIRD-PARTY-LICENSES.txt"]
 # gzip rather than xz for the Linux tarball: minimal images (NI's among them)
 # need not have xz-utils, and scripts/install.sh unpacks it with tar -z.
 unix-archive = ".tar.gz"
