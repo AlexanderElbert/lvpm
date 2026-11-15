@@ -225,8 +225,7 @@ their packages, or uninstall affected global packages with the previous lvpm
 version before reinstalling them.
 In a venv, packages declared in any dependency group and their installed
 transitive dependencies are kept during automatic dependency removal.
-Explicitly uninstalling a declared package warns and leaves the manifest
-unchanged. `uninstall --all` still removes every package.
+`uninstall --all` still removes every package.
 Venvs remember the manifest used at creation, including one named with
 `--manifest`. Venvs whose bindings do not identify their manifest must be
 removed and recreated, as must a venv an earlier lvpm created from a

@@ -39,13 +39,21 @@ $ lvpm import <file> --dry-run       # show it, write nothing
 - **Which manifest.** The one the venv in effect is bound to; else
   `--project`'s or the nearest `lvpm.toml`; else a new `lvpm.toml` in the
   working directory. No venv is needed.
-- **A venv created from a `vipm.toml`** by an earlier lvpm is not
-  supported: commands that read its manifest refuse it. Remove it with
-  `lvpm venv remove`, import, and create it again.
+- **A venv created from a `vipm.toml`** by an earlier lvpm (0.3.0 and
+  before, `venv create --manifest vipm.toml`): `lvpm import vipm.toml`
+  writes `lvpm.toml` beside it and binds the venv to that file. What is
+  installed in the venv stays; nothing needs reinstalling. Until then
+  `install`, `launch` and `uninstall <name>` refuse that venv and name the
+  import.
+- **One write.** The import writes `lvpm.toml` once, at the end. If it fails
+  part-way, the manifest is as it was, and no new manifest is left behind.
 - **Versions** are written exact (`name = "1.2.3.4"`), as VIPM installs
   them. An entry the manifest already has is updated in place, in the
-  group that declares it unless `--group` names one. Each change is
-  reported; running the import again changes nothing.
+  group that declares it unless `--group` names one; `[dev-dependencies]`
+  go to `[dependencies.dev]` unless another group already declares the
+  package. A version that is not a version (for example `"latest"`) is
+  rejected, naming the entry. Each change is reported; running the import
+  again changes nothing.
 - **`[project]` keys** (`name`, `version`, `labview`) are written only where
   the manifest has none. A different existing value is kept and reported.
 - **LabVIEW.** VIPM's LabVIEW version becomes `labview`, which lvpm reads as
@@ -113,6 +121,9 @@ The packages left out are listed, each with the package that pulls it in.
 `lvpm install` resolves them again from their dependents' floors, so it may
 pick newer versions than the file lists. `--all` pins them too.
 
+A `config.xml` entry with no version in its name is left out, with a
+warning; the other packages are imported.
+
 ### LabVIEW
 
 The target's version becomes `labview`: `26.1 (64-bit)` is `"2026"`.
@@ -121,7 +132,9 @@ Targets older than LabVIEW 2009 are not named by year and are skipped.
 ### Packages carried in the file
 
 Packages the `.vipc` carries go into the package cache, as
-`lvpm cache add` would, so `lvpm install` finds them.
+`lvpm cache add` would, so `lvpm install` finds them. A carried package is
+imported under the name and version its own spec gives; when `config.xml`
+lists it differently, lvpm warns and pins what the archive holds.
 
 The import then checks the indexes. It ends with a note naming every such
 package that no index has at that version. Only this machine's cache has
