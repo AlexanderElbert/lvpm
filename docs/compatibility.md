@@ -39,8 +39,8 @@ $ lvpm import <file> --dry-run       # show it, write nothing
 - **Which manifest.** The one the venv in effect is bound to; else
   `--project`'s or the nearest `lvpm.toml`; else a new `lvpm.toml` in the
   working directory. No venv is needed.
-- **A venv created from a `vipm.toml`** by an earlier lvpm (0.3.0 and
-  before, `venv create --manifest vipm.toml`): `lvpm import vipm.toml`
+- **A venv created from a `vipm.toml`** by an earlier lvpm
+  (`venv create --manifest vipm.toml`): `lvpm import vipm.toml`
   writes `lvpm.toml` beside it and binds the venv to that file. What is
   installed in the venv stays; nothing needs reinstalling. Until then
   `install`, `launch` and `uninstall <name>` refuse that venv and name the
