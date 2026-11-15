@@ -9,6 +9,18 @@ Every option installs two files: `lvpm` (`lvpm.exe`) and `relink-package.vi` nex
 it. lvpm hands the VI to LabVIEW for `--relink`, and refuses one that did not
 come with the same release, so keep them together.
 
+## Upgrading lvpm
+
+Rerun the installation script to install the newest release, or download and run
+the newer MSI on Windows. The MSI upgrades the existing installation in place.
+For a manual installation, replace both the executable and `relink-package.vi`
+with the files from the same release.
+
+Interactive commands show a notice when a newer stable release is available,
+but never install it. Checks are cached daily and add at most 150 ms to a
+command. See [update notifications](configuration.md#update-notifications)
+for details and how to disable them.
+
 ## With the installer
 
 Download `lvpm-x86_64-pc-windows-msvc.msi` from the

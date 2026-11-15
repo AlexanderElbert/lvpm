@@ -32,6 +32,7 @@ sha2 = "0.11.0"
 toml = { version = "1.1.5", features = ["preserve_order"] }
 zip = "9.5.1"
 toml_edit = "0.25.19"
+semver = { version = "1.0.28", features = ["serde"] }
 
 [build-dependencies]
 md-5 = "0.11.0"

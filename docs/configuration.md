@@ -36,6 +36,30 @@ lvpm search caraya
 In CI, set `LVPM_CONFIG_CACHE` on the job to keep the cache on a persistent
 volume between runs.
 
+## Update notifications
+
+On interactive runs (both stdout and stderr are terminals), lvpm checks GitHub
+Releases in the background and prints a notice to stderr when a newer version is
+available. Only stable releases count: drafts, releases marked as prereleases
+and versions such as `0.4.0-rc.1` are ignored. It compares semantic versions,
+not release dates.
+
+Completed checks are cached for 24 hours in `update-check.json` in the configured
+cache folder, including failed checks to avoid repeated requests while offline.
+Requests time out after two seconds. A command waits at most 150 ms for a check
+still running when it finishes; past that the check is abandoned, and the next
+attempt is made an hour later. A previously cached newer version is shown
+immediately. The notice is shown only after a successful command.
+Update-check failures go to the debug log and never fail the command.
+
+Set `LVPM_NO_UPDATE_CHECK` to disable both checks and notices. Its presence is
+enough, even with an empty value. Checks are also disabled when `CI` or
+`LV_RTE_HEADLESS` is set, when output is redirected, and for `--help` or
+`--version`.
+
+This only notifies; it does not install anything. See
+[upgrading lvpm](installation.md#upgrading-lvpm).
+
 ## Logs
 
 lvpm keeps its logs in one folder, `%LOCALAPPDATA%\lvpm\logs` on Windows (the

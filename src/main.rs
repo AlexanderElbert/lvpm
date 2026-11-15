@@ -37,6 +37,7 @@ mod resolve;
 mod shadow;
 mod spec;
 mod target;
+mod update_notice;
 mod venv;
 mod version;
 mod vipm_interop;
@@ -443,7 +444,11 @@ fn main() -> Result<()> {
         Err(e) => bail!(e),
     };
     logging::init(level);
+    let update_notice = update_notice::start();
     let result = run(&cli);
+    if let (Some(notice), Ok(())) = (update_notice, &result) {
+        notice.finish();
+    }
     logging::finish(&result);
     result
 }
