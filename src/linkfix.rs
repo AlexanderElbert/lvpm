@@ -1483,12 +1483,34 @@ impl Changes {
     }
 }
 
-/// The block-diagram heap, inflated: what the diagram's nodes hold.
-fn heap_bytes(rsrc: &Rsrc) -> Option<Vec<u8>> {
-    let s = rsrc.section(b"BDHc").or_else(|| rsrc.section(b"BDHb"))?;
-    let mut out = Vec::new();
-    flate2::read::ZlibDecoder::new(s.data.get(4..)?).read_to_end(&mut out).ok()?;
-    Some(out)
+/// The block-diagram heap, inflated on first use: what the diagram's nodes
+/// hold. Inflating costs far more than the VI's links do and only a Call
+/// Library link that needs a wildcard repair reads it, so most VIs never pay.
+/// It holds the compressed bytes, not the [`Rsrc`], because the link pass
+/// borrows the sections mutably while it runs.
+struct LazyHeap {
+    packed: Option<Vec<u8>>,
+    inflated: std::cell::OnceCell<Vec<u8>>,
+}
+
+impl LazyHeap {
+    fn new(rsrc: &Rsrc) -> Self {
+        let s = rsrc.section(b"BDHc").or_else(|| rsrc.section(b"BDHb"));
+        LazyHeap { packed: s.map(|s| s.data.clone()), inflated: std::cell::OnceCell::new() }
+    }
+
+    /// The inflated heap; empty if the VI has none or it does not inflate.
+    fn get(&self) -> &[u8] {
+        self.inflated.get_or_init(|| {
+            let mut out = Vec::new();
+            let ok = self
+                .packed
+                .as_deref()
+                .and_then(|d| d.get(4..))
+                .is_some_and(|z| flate2::read::ZlibDecoder::new(z).read_to_end(&mut out).is_ok());
+            if ok { out } else { Vec::new() }
+        })
+    }
 }
 
 /// The two cross-platform wildcards a Call Library Function node's library
@@ -1541,7 +1563,7 @@ fn resolve_wildcard(kind: Wildcard, prefix: &[u8], ext: &[u8], bits: u8) -> Vec<
 /// loading the VI there (measured on NI's Advanced HTTP Client after its
 /// PostInstall hook: `lvwebclient_*.*`, `.../lvwebclient_64.dll`). Nothing
 /// changes unless that file is in the tree beside the one named.
-fn fix_clfn_wildcard(o: &mut LinkObj, target: &str, bits: u8, heap: &[u8], tree: &Tree) -> bool {
+fn fix_clfn_wildcard(o: &mut LinkObj, target: &str, bits: u8, heap: &LazyHeap, tree: &Tree) -> bool {
     if &o.ident != b"NEXF" || o.qual.len() != 1 || o.path.comps.is_empty() {
         return false;
     }
@@ -1553,7 +1575,7 @@ fn fix_clfn_wildcard(o: &mut LinkObj, target: &str, bits: u8, heap: &[u8], tree:
     let in_heap = |w: &[u8]| {
         let mut needle = vec![w.len() as u8];
         needle.extend_from_slice(w);
-        w.len() < 256 && heap.windows(needle.len()).any(|x| x == needle.as_slice())
+        w.len() < 256 && heap.get().windows(needle.len()).any(|x| x == needle.as_slice())
     };
     let Some((wildcard, kind, prefix)) = wildcard_sources(&lib).into_iter().find(|(w, _, _)| in_heap(w)) else {
         return false;
@@ -1611,8 +1633,8 @@ pub fn fix_vi(bytes: &[u8], vi_logical: &str, tree: &Tree, m: Methods) -> Result
         }
     }
 
-    // Read once, and only when a Call Library link might need it.
-    let heap = m.bitness.and_then(|_| heap_bytes(&rsrc)).unwrap_or_default();
+    // Inflated at most once, and only when a Call Library link needs it.
+    let heap = LazyHeap::new(&rsrc);
 
     for sec in rsrc.sections.iter_mut() {
         if !m.links() || !matches!(&sec.ident, b"LIvi" | b"LIbd" | b"LIfp" | b"LIds") {
@@ -2103,6 +2125,34 @@ pub fn summarize(outcomes: &[Outcome]) -> BTreeMap<&'static str, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_heap_is_inflated_only_when_a_call_library_link_reads_it() {
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(b"heap bytes").unwrap();
+        let mut packed = vec![0, 0, 0, 10];
+        packed.extend(z.finish().unwrap());
+        let heap = LazyHeap { packed: Some(packed), inflated: std::cell::OnceCell::new() };
+
+        // A link that is not a Call Library node never reaches the heap.
+        let mut o = LinkObj {
+            ident: *b"VIVI",
+            qual: vec![b"lib.*".to_vec()],
+            path: Pth { tp: 0, comps: vec![b"a".to_vec()], zero: false },
+            flag: 0,
+            tail: Vec::new(),
+            tail_pos: 0,
+        };
+        let tree = Tree::index(&[]).unwrap();
+        assert!(!fix_clfn_wildcard(&mut o, "target", 64, &heap, &tree));
+        assert!(heap.inflated.get().is_none());
+
+        assert_eq!(heap.get(), b"heap bytes");
+        assert!(heap.inflated.get().is_some());
+        // A VI with no heap, or one that does not inflate, reads as empty.
+        assert!(LazyHeap { packed: None, inflated: std::cell::OnceCell::new() }.get().is_empty());
+        assert!(LazyHeap { packed: Some(vec![0; 9]), inflated: std::cell::OnceCell::new() }.get().is_empty());
+    }
 
     #[test]
     fn venv_layout_roots_include_newly_installed_files() {
