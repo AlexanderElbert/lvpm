@@ -88,7 +88,7 @@ impl Venv {
     pub fn roots_for_pkg(&self, pkg: &str) -> Result<Roots> {
         ensure!(
             !pkg.is_empty() && pkg != "." && pkg != ".."
-                && pkg.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)),
+                && pkg.chars().all(|c| c.is_ascii_alphanumeric() || "._-&".contains(c)),
             "package name {pkg:?} cannot be an addon folder name"
         );
         Ok(Roots::project(&self.dir, &self.target, pkg))
@@ -554,9 +554,12 @@ mod tests {
         assert_eq!(v.data_dir(), dir.join("data"));
         assert_eq!(v.temp_dir(), dir.join("temp"));
         assert_eq!(v.pid_path(), dir.join("labview.pid"));
-        assert!(v.roots_for_pkg(".").is_err());
-        assert!(v.roots_for_pkg("..").is_err());
-        assert_eq!(v.roots_for_pkg("pkg").unwrap().application, dir.join("packages").join("pkg").join("1"));
+        for pkg in ["", ".", "..", "../pkg", r"..\pkg", "/pkg", r"C:\pkg"] {
+            assert!(v.roots_for_pkg(pkg).is_err(), "{pkg:?}");
+        }
+        for pkg in ["pkg", "pkg&extra"] {
+            assert_eq!(v.roots_for_pkg(pkg).unwrap().application, dir.join("packages").join(pkg).join("1"));
+        }
 
         std::fs::write(v.ini_path(), "[LabVIEW]\ncustom=True\n").unwrap();
         launch::write_ini(&v, &[]).unwrap();
