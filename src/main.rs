@@ -691,21 +691,30 @@ fn destination(cli: &Cli) -> Result<Destination> {
         true => Destination::Global(r),
         false => Destination::Scratch(r),
     };
+    // A venv attaches its own log file; everything else that resolves to a
+    // destination logs to lvpm.log from here on, so a run cut off keeps what
+    // it logged.
     if cli.prefix.is_some() || cli.global {
-        return roots_for(cli).map(explicit);
+        let roots = roots_for(cli)?;
+        logging::attach_default();
+        return Ok(explicit(roots));
     }
     let cwd = std::env::current_dir()?;
     if headless()
         && cli.project.is_none()
         && let venv::Found::ManifestOnly(repo) = venv::probe(&cwd)?
     {
-        return headless_roots(cli, &repo).map(Destination::Global);
+        let roots = headless_roots(cli, &repo)?;
+        logging::attach_default();
+        return Ok(Destination::Global(roots));
     }
     if let Some(v) = venv::find(cli.project.as_deref(), &cwd)? {
         elog!("{}", v.banner());
         return Ok(Destination::Venv(v));
     }
-    roots_for(cli).map(explicit)
+    let roots = roots_for(cli)?;
+    logging::attach_default();
+    Ok(explicit(roots))
 }
 
 /// The installation a headless `lvpm install` in a venv-less project means:

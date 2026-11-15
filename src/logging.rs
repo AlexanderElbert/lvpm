@@ -6,15 +6,20 @@
 //! `lvpm.log`. Every run writes a header naming the command (and the venv),
 //! everything it printed (as `info`), detail that only goes to the file
 //! (`debug`: each file linkfix touched, each download), and how it ended.
-//! Records written before the venv is known (argument checks, the lookup
-//! itself) are held and written once it is.
+//! Records written before the file is known (argument checks, the lookup
+//! itself) are held and written once it is. A command on a venv, or one that
+//! installs into a LabVIEW installation or a `--prefix` tree, knows its file
+//! as soon as it has found its destination and writes as it goes; a command
+//! that never resolves a destination (`targets`, `search`, `config`,
+//! `cache add`, `import`) is written to `lvpm.log` when it ends.
 //!
 //! The file level is `--log-level`, else `LVPM_LOG`, else `debug`. The console
 //! is unchanged by it: what a command prints, it prints at every level.
 //!
 //! The file is opened in append mode and written one record per write, with
-//! no buffer, so a run cut off by Ctrl+C or a crash keeps what it logged and
-//! two lvpm processes on one venv interleave whole lines. Logging never fails
+//! no buffer, so a run cut off by Ctrl+C or a crash keeps what it logged (from
+//! the point its file is known) and two lvpm processes on one venv interleave
+//! whole lines. Logging never fails
 //! a command: a log that cannot be written is reported once and dropped.
 
 use crate::{config, venv};
@@ -134,7 +139,18 @@ pub fn attach_venv(repo: &Path, venv_dir: &Path) {
 /// starting with whatever was logged before. A second call for the same file
 /// does nothing.
 fn attach(path: &Path) {
-    let mut s = lock();
+    attach_to(&mut lock(), path);
+}
+
+/// Write the log of a command that does not run on a venv to `lvpm.log` from
+/// now on. A command calls this once it has resolved its destination, so a
+/// run that is cut off keeps what it logged; `finish` does it for the rest.
+pub fn attach_default() {
+    attach(&config::log_dir().join(FILE_NAME));
+}
+
+/// [`attach`] on a given state, so a test can use a private one.
+fn attach_to(s: &mut State, path: &Path) {
     if s.path.as_deref() == Some(path) {
         return;
     }
@@ -155,7 +171,7 @@ fn attach(path: &Path) {
             s.file = Some(f);
             s.path = Some(path.to_path_buf());
         }
-        Err(e) => report_failure(&mut s, path, &e),
+        Err(e) => report_failure(s, path, &e),
     }
 }
 
@@ -179,7 +195,7 @@ pub fn finish(result: &anyhow::Result<()>) {
     }
     let attached = lock().file.is_some();
     if !attached {
-        attach(&config::log_dir().join(FILE_NAME));
+        attach_default();
     }
 }
 
@@ -209,15 +225,22 @@ fn write(level: Level, target: &str, msg: &str) {
     if text.is_empty() {
         return;
     }
-    let mut s = lock();
+    record(&mut lock(), text);
+}
+
+/// Write `text` to the attached file, or hold it until one is attached. After
+/// a failed write or a failed attach the log is dropped, not held: nothing
+/// would ever write the held lines, and they would only grow.
+fn record(s: &mut State, text: String) {
     let written = s.file.as_mut().map(|f| f.write_all(text.as_bytes()));
     match written {
-        None => s.pending.push(text),
-        Some(Ok(())) => {}
+        None if !s.failed => s.pending.push(text),
+        None | Some(Ok(())) => {}
         Some(Err(e)) => {
             let path = s.path.clone().unwrap_or_default();
-            report_failure(&mut s, &path, &e);
+            report_failure(s, &path, &e);
             s.file = None;
+            s.pending.clear();
         }
     }
 }
@@ -355,6 +378,47 @@ mod tests {
         let cut = name(&deep);
         assert!(cut.starts_with("nested-nested-") && cut.ends_with("nested-my-app-3fa2c1d0.log"), "{cut}");
         assert!(cut.trim_end_matches("-3fa2c1d0.log").chars().count() <= NAME_MAX, "{cut}");
+    }
+
+    fn empty() -> State {
+        State { file: None, path: None, pending: Vec::new(), partial: [String::new(), String::new()], failed: false }
+    }
+
+    #[test]
+    fn a_record_is_in_the_file_as_soon_as_it_is_written() {
+        let dir = std::env::temp_dir().join(format!("lvpm-logging-test-{}", std::process::id()));
+        let path = dir.join("sub").join("test.log");
+        let mut s = empty();
+        record(&mut s, "early
+".into());
+        assert_eq!(s.pending.len(), 1);
+        attach_to(&mut s, &path);
+        assert!(s.pending.is_empty());
+        record(&mut s, "later
+".into());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "early
+later
+");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn after_a_failed_write_later_records_are_dropped() {
+        let dir = std::env::temp_dir().join(format!("lvpm-logging-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ro.log");
+        std::fs::write(&path, "").unwrap();
+        let mut s = empty();
+        s.path = Some(path.clone());
+        // A file opened for reading only: every write to it fails.
+        s.file = Some(File::open(&path).unwrap());
+        record(&mut s, "one
+".into());
+        assert!(s.failed && s.file.is_none());
+        record(&mut s, "two
+".into());
+        assert!(s.pending.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

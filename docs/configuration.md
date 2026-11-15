@@ -49,7 +49,10 @@ a hash of the venv's path that keeps similar paths apart:
   c--git-my-project-3fa2c1d0.log  every command run on the venv of C:\Git\my-project
 ```
 
-`lvpm venv create` and `lvpm venv status` show the venv's log file. Each command
+`lvpm venv create` and `lvpm venv status` show the venv's log file. A command
+writes to its log as it runs, so a run cut off by Ctrl+C or a crash keeps what
+it logged; commands that touch no venv or installation (`targets`, `search`,
+`config`) are written when they end. Each command
 appends a header (the command, its directory and the venv), everything it
 printed, detail it does not print, and how it ended (`---- done` or
 `---- failed: …`). Each line carries a UTC timestamp, the process id and a
