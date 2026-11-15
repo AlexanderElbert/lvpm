@@ -247,6 +247,13 @@ pub fn cache_add(cache_dir: &Path, source: &Path, refresh: bool) -> Result<Vec<I
 /// packages) into the cache, as `cache add` does for a file of its own, so
 /// the resolver finds them like any imported package. Returns the package's
 /// name, version and SHA-256, and whether those bytes were stored already.
+/// The name and version a package archive gives itself in its `spec`,
+/// without caching it: what an install of those bytes would record.
+pub fn package_identity(bytes: &[u8]) -> Result<(String, String)> {
+    let entry = entry_from_bytes(Path::new(""), bytes)?;
+    Ok((entry.name, entry.version.raw))
+}
+
 pub fn cache_add_bytes(cache_dir: &Path, source_ref: &str, bytes: &[u8]) -> Result<(String, String, String, bool)> {
     let entry = entry_from_bytes(Path::new(source_ref), bytes).with_context(|| format!("importing {source_ref}"))?;
     let cache = Cache::open(cache_dir)?;

@@ -485,45 +485,7 @@ pub enum Saved {
 /// table is created.
 pub fn save_dependency(path: &Path, group: Option<&str>, name: &str, version: &str) -> Result<Saved> {
     let mut edit = Edit::open(path)?;
-    let declared = edit.declared_in(name);
-    let group = match group {
-        Some(g) => g.to_string(),
-        None => declared.first().map(|(g, _)| g.clone()).unwrap_or_else(|| MAIN_GROUP.to_string()),
-    };
-    if group != MAIN_GROUP && !edit.groups().contains(&group) && edit.is_entry(&group) {
-        bail!("{} declares a package named {group:?}; it cannot also be a group", path.display());
-    }
-    let table = edit.group_table(&group)?;
-    let key = table.iter().map(|(k, _)| k.to_string()).find(|k| k.eq_ignore_ascii_case(name));
-    let saved = match key {
-        Some(key) => {
-            let item = table.get_mut(&key).expect("key was just found");
-            let from = match item.as_table_like_mut() {
-                Some(t) => {
-                    let from = t.get("version").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                    t.insert("version", toml_edit::value(version));
-                    from
-                }
-                None => {
-                    let from = item.as_str().unwrap_or_default().to_string();
-                    let decor = item.as_value().map(|v| v.decor().clone());
-                    *item = toml_edit::value(version);
-                    if let (Some(decor), Some(v)) = (decor, item.as_value_mut()) {
-                        *v.decor_mut() = decor;
-                    }
-                    from
-                }
-            };
-            match from == version {
-                true => Saved::Unchanged { group },
-                false => Saved::Updated { group, from },
-            }
-        }
-        None => {
-            table.insert(name, toml_edit::value(version));
-            Saved::Added { group }
-        }
-    };
+    let saved = edit.save_dependency(group, MAIN_GROUP, name, version)?;
     edit.write()?;
     Ok(saved)
 }
@@ -535,72 +497,13 @@ pub fn remove_dependency(path: &Path, name: &str) -> Result<Vec<String>> {
     let mut edit = Edit::open(path)?;
     let declared = edit.declared_in(name);
     if declared.is_empty() {
-        return Ok(declared.into_iter().map(|(g, _)| g).collect());
+        return Ok(Vec::new());
     }
     for (group, key) in &declared {
         edit.group_table(group)?.remove(key);
     }
     edit.write()?;
     Ok(declared.into_iter().map(|(g, _)| g).collect())
-}
-
-/// Set `[project] <key>` (`labview`, `name`, `version`) in `path` unless it
-/// is set already; returns the value already there, if any, which is left
-/// alone.
-pub fn set_project_if_missing(path: &Path, key: &str, value: &str) -> Result<Option<String>> {
-    let mut edit = Edit::open(path)?;
-    let root = edit.doc.as_table_mut();
-    if !root.contains_key("project") {
-        root.insert("project", toml_edit::Item::Table(toml_edit::Table::new()));
-    }
-    let project = root["project"]
-        .as_table_like_mut()
-        .with_context(|| format!("{}: project is not a table", path.display()))?;
-    if let Some(existing) = project.get(key) {
-        return Ok(Some(existing.as_str().unwrap_or_default().to_string()));
-    }
-    project.insert(key, toml_edit::value(value));
-    edit.write()?;
-    Ok(None)
-}
-
-/// Write `name = value` into `[nipm.dependencies]`, replacing an entry of
-/// the same name. Returns whether anything changed. The value is copied as
-/// written (a version string or a `{ version, feed }` table).
-pub fn save_nipm(path: &Path, name: &str, value: &toml::Value) -> Result<bool> {
-    let mut edit = Edit::open(path)?;
-    let new: toml_edit::Value = value
-        .to_string()
-        .parse()
-        .with_context(|| format!("[nipm.dependencies] {name}: cannot copy {value}"))?;
-    let root = edit.doc.as_table_mut();
-    if !root.contains_key("nipm") {
-        let mut nipm = toml_edit::Table::new();
-        nipm.set_implicit(true);
-        root.insert("nipm", toml_edit::Item::Table(nipm));
-    }
-    let nipm = root["nipm"]
-        .as_table_like_mut()
-        .with_context(|| format!("{}: nipm is not a table", path.display()))?;
-    if nipm.get("dependencies").is_none() {
-        nipm.insert("dependencies", toml_edit::Item::Table(toml_edit::Table::new()));
-    }
-    let deps = nipm
-        .get_mut("dependencies")
-        .and_then(|d| d.as_table_like_mut())
-        .with_context(|| format!("{}: nipm.dependencies is not a table", path.display()))?;
-    let key = deps.iter().map(|(k, _)| k.to_string()).find(|k| k.eq_ignore_ascii_case(name));
-    let same = key
-        .as_deref()
-        .and_then(|k| deps.get(k))
-        .and_then(|i| i.as_value())
-        .is_some_and(|v| v.to_string().trim() == new.to_string().trim());
-    if same {
-        return Ok(false);
-    }
-    deps.insert(key.as_deref().unwrap_or(name), toml_edit::Item::Value(new));
-    edit.write()?;
-    Ok(true)
 }
 
 /// The skeleton `lvpm venv create` and `lvpm import` write when a project
@@ -613,18 +516,124 @@ pub fn skeleton(name: &str, labview: Option<&str>) -> String {
     }
 }
 
-/// A manifest open for editing.
-struct Edit {
+/// A manifest open for editing. Edits change the document in memory; nothing
+/// reaches the file until [`Edit::write`], so a command that makes several
+/// (`lvpm import`) either writes them all or leaves the file as it was.
+pub struct Edit {
     path: PathBuf,
     doc: toml_edit::DocumentMut,
     crlf: bool,
 }
 
 impl Edit {
-    fn open(path: &Path) -> Result<Edit> {
+    pub fn open(path: &Path) -> Result<Edit> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading manifest {}", path.display()))?;
+        Edit::from_text(path, &text)
+    }
+
+    /// A manifest that is not on disk yet, starting as `text` (a
+    /// [`skeleton`]); [`Edit::write`] creates the file.
+    pub fn from_text(path: &Path, text: &str) -> Result<Edit> {
         let doc = text.parse().with_context(|| format!("parsing manifest {}", path.display()))?;
         Ok(Edit { path: path.to_path_buf(), doc, crlf: text.contains("\r\n") })
+    }
+
+    /// Write `name = "version"` into `group` when one is given, else into the
+    /// group already declaring `name`, else into `default`. An existing
+    /// entry keeps its key spelling and, as a table, its `hooks` and
+    /// `relink`; only its version changes. A missing group table is created.
+    pub fn save_dependency(&mut self, group: Option<&str>, default: &str, name: &str, version: &str) -> Result<Saved> {
+        let declared = self.declared_in(name);
+        let group = match group {
+            Some(g) => g.to_string(),
+            None => declared.first().map(|(g, _)| g.clone()).unwrap_or_else(|| default.to_string()),
+        };
+        if group != MAIN_GROUP && !self.groups().contains(&group) && self.is_entry(&group) {
+            bail!("{} declares a package named {group:?}; it cannot also be a group", self.path.display());
+        }
+        let table = self.group_table(&group)?;
+        let key = table.iter().map(|(k, _)| k.to_string()).find(|k| k.eq_ignore_ascii_case(name));
+        Ok(match key {
+            Some(key) => {
+                let item = table.get_mut(&key).expect("key was just found");
+                let from = match item.as_table_like_mut() {
+                    Some(t) => {
+                        let from = t.get("version").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                        t.insert("version", toml_edit::value(version));
+                        from
+                    }
+                    None => {
+                        let from = item.as_str().unwrap_or_default().to_string();
+                        let decor = item.as_value().map(|v| v.decor().clone());
+                        *item = toml_edit::value(version);
+                        if let (Some(decor), Some(v)) = (decor, item.as_value_mut()) {
+                            *v.decor_mut() = decor;
+                        }
+                        from
+                    }
+                };
+                match from == version {
+                    true => Saved::Unchanged { group },
+                    false => Saved::Updated { group, from },
+                }
+            }
+            None => {
+                table.insert(name, toml_edit::value(version));
+                Saved::Added { group }
+            }
+        })
+    }
+
+    /// Set `[project] <key>` unless it is set already; returns the value
+    /// already there, if any, which is left alone.
+    pub fn set_project_if_missing(&mut self, key: &str, value: &str) -> Result<Option<String>> {
+        let path = self.path.display().to_string();
+        let root = self.doc.as_table_mut();
+        if !root.contains_key("project") {
+            root.insert("project", toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        let project = root["project"].as_table_like_mut().with_context(|| format!("{path}: project is not a table"))?;
+        if let Some(existing) = project.get(key) {
+            return Ok(Some(existing.as_str().unwrap_or_default().to_string()));
+        }
+        project.insert(key, toml_edit::value(value));
+        Ok(None)
+    }
+
+    /// Write `name = value` into `[nipm.dependencies]`, replacing an entry of
+    /// the same name. Returns whether anything changed. The value is copied
+    /// as written (a version string or a `{ version, feed }` table).
+    pub fn save_nipm(&mut self, name: &str, value: &toml::Value) -> Result<bool> {
+        let path = self.path.display().to_string();
+        let new: toml_edit::Value = value
+            .to_string()
+            .parse()
+            .with_context(|| format!("[nipm.dependencies] {name}: cannot copy {value}"))?;
+        let root = self.doc.as_table_mut();
+        if !root.contains_key("nipm") {
+            let mut nipm = toml_edit::Table::new();
+            nipm.set_implicit(true);
+            root.insert("nipm", toml_edit::Item::Table(nipm));
+        }
+        let nipm = root["nipm"].as_table_like_mut().with_context(|| format!("{path}: nipm is not a table"))?;
+        if nipm.get("dependencies").is_none() {
+            nipm.insert("dependencies", toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        let deps = nipm
+            .get_mut("dependencies")
+            .and_then(|d| d.as_table_like_mut())
+            .with_context(|| format!("{path}: nipm.dependencies is not a table"))?;
+        let key = deps.iter().map(|(k, _)| k.to_string()).find(|k| k.eq_ignore_ascii_case(name));
+        let same = key
+            .as_deref()
+            .and_then(|k| deps.get(k))
+            .and_then(|i| i.as_value())
+            .is_some_and(|v| v.to_string().trim() == new.to_string().trim());
+        if same {
+            return Ok(false);
+        }
+        deps.insert(key.as_deref().unwrap_or(name), toml_edit::Item::Value(new));
+        Ok(true)
     }
 
     fn dependencies(&self) -> Option<&dyn toml_edit::TableLike> {
@@ -687,14 +696,23 @@ impl Edit {
     }
 
     /// Write the file back, in its own line endings, once it still reads as
-    /// a manifest.
-    fn write(&self) -> Result<()> {
+    /// a manifest. Through a file beside it and a rename, so a write that is
+    /// cut short leaves the manifest as it was.
+    pub fn write(&self) -> Result<()> {
         let mut text = self.doc.to_string();
         if self.crlf {
             text = text.replace("\r\n", "\n").replace('\n', "\r\n");
         }
         parse(&text).with_context(|| format!("the edited {} would not read back", self.path.display()))?;
-        std::fs::write(&self.path, text).with_context(|| format!("writing manifest {}", self.path.display()))
+        let mut tmp = self.path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, text)
+            .and_then(|_| std::fs::rename(&tmp, &self.path))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
+            .with_context(|| format!("writing manifest {}", self.path.display()))
     }
 }
 
@@ -1072,6 +1090,73 @@ pkg_a = "*"
         let after = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         after
+    }
+
+    fn set_project_if_missing(path: &Path, key: &str, value: &str) -> Result<Option<String>> {
+        let mut edit = Edit::open(path)?;
+        let had = edit.set_project_if_missing(key, value)?;
+        edit.write()?;
+        Ok(had)
+    }
+
+    fn save_nipm(path: &Path, name: &str, value: &toml::Value) -> Result<bool> {
+        let mut edit = Edit::open(path)?;
+        let changed = edit.save_nipm(name, value)?;
+        edit.write()?;
+        Ok(changed)
+    }
+
+    #[test]
+    fn edits_stay_in_memory_until_written_and_a_new_manifest_starts_from_text() {
+        let dir = std::env::temp_dir().join(format!("lvpm-edit-memory-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        let before = "[dependencies]\nci = \"1.0\"\n";
+        std::fs::write(&path, before).unwrap();
+
+        // Several edits, then one that fails: the file has none of them.
+        let mut edit = Edit::open(&path).unwrap();
+        assert_eq!(edit.save_dependency(None, MAIN_GROUP, "a", "1").unwrap(), Saved::Added { group: "main".into() });
+        assert_eq!(edit.set_project_if_missing("labview", "2024").unwrap(), None);
+        let err = edit.save_dependency(Some("ci"), MAIN_GROUP, "b", "1").unwrap_err();
+        assert!(format!("{err:#}").contains("cannot also be a group"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        edit.write().unwrap();
+        let after = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after.declared_dependency_names().collect::<Vec<_>>(), ["ci", "a"]);
+        assert_eq!(after.labview.as_deref(), Some("2024"));
+        assert!(!dir.join("lvpm.toml.tmp").exists());
+
+        // A manifest that does not exist yet is created by the write, not before.
+        let new = dir.join("new").join(FILE_NAME);
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        let mut edit = Edit::from_text(&new, &skeleton("demo", None)).unwrap();
+        edit.save_dependency(None, MAIN_GROUP, "a", "1").unwrap();
+        assert!(!new.exists());
+        edit.write().unwrap();
+        assert_eq!(parse(&std::fs::read_to_string(&new).unwrap()).unwrap().name.as_deref(), Some("demo"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_default_group_gives_way_to_the_group_already_declaring_the_package() {
+        let after = edited("[dependencies]\n\n[dependencies.test]\ncaraya = \"1.0\"\n", |p| {
+            let mut edit = Edit::open(p)?;
+            // Declared in `test`: updated there, not duplicated into `dev`.
+            assert_eq!(
+                edit.save_dependency(None, "dev", "Caraya", "1.4.5.165")?,
+                Saved::Updated { group: "test".into(), from: "1.0".into() }
+            );
+            // Declared nowhere: the default group, created.
+            assert_eq!(edit.save_dependency(None, "dev", "lint", "2.0")?, Saved::Added { group: "dev".into() });
+            // An explicit group wins over both.
+            assert_eq!(edit.save_dependency(Some("ci"), "dev", "caraya", "1.4.5.165")?, Saved::Added { group: "ci".into() });
+            edit.write()
+        });
+        let p = parse(&after).unwrap();
+        let group = |name: &str| p.groups.iter().find(|(n, _)| n == name).map(|(_, g)| g.dependencies.len());
+        assert_eq!((group("test"), group("dev"), group("ci")), (Some(1), Some(1), Some(1)), "{after}");
     }
 
     const MANIFEST: &str = "# my project\n[project]\nname = \"demo\"\n\n[dependencies]\n\
