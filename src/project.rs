@@ -732,9 +732,7 @@ impl Edit {
 /// A table under `[dependencies]` that is a group rather than one dependency
 /// (see [`is_dependency_table`]).
 fn is_group_item(item: &toml_edit::Item) -> bool {
-    item.as_table_like().is_some_and(|t| {
-        !(t.contains_key("version") && t.iter().all(|(k, _)| DEPENDENCY_KEYS.contains(&k)))
-    })
+    item.as_table_like().is_some_and(|t| !t.iter().any(|(k, _)| DEPENDENCY_KEYS.contains(&k)))
 }
 
 #[cfg(test)]
