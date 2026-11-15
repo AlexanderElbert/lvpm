@@ -1418,18 +1418,38 @@ fn cmd_uninstall(
     };
     ensure!(!names.is_empty(), "no packages are installed in this target");
 
+    // Uninstalled by name on a venv: out of the manifest too, from every group
+    // declaring it. Run once, after the sweep, or earlier when a dependency's
+    // failure ends the sweep with the named package already gone.
+    let unsave_now = || {
+        if let Some((path, name)) = &unsave {
+            let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match project::remove_dependency(path, name) {
+                Ok(groups) if groups.is_empty() => {}
+                Ok(groups) => log!(
+                    "removed {name} from {file} {}",
+                    groups.iter().map(|g| group_label(g)).collect::<Vec<_>>().join(", ")
+                ),
+                Err(e) => wlog!("{name} is uninstalled, but the manifest was not updated: {e:#}"),
+            }
+        }
+    };
+
     // One VI Server connection for the whole sweep, and one palette refresh at
     // the end — the hooks are per package, the rebuild is not.
     let mut conn: Option<viserver::Connection> = None;
     let mut removed_any = false;
     let mut failed: Vec<(String, anyhow::Error)> = Vec::new();
-    for name in &names {
+    for (i, name) in names.iter().enumerate() {
         match uninstall_one(&roots, name, &mut conn) {
             Ok(removed) => removed_any |= removed > 0,
             // One bad package must not strand the rest of an --all sweep. A
             // single named package still fails the command with its own error.
             Err(e) => {
                 if !all {
+                    if named_package_removed_before(i) {
+                        unsave_now();
+                    }
                     return Err(e);
                 }
                 if names.len() > 1 {
@@ -1443,19 +1463,9 @@ fn cmd_uninstall(
         c.close();
     }
 
-    // Uninstalled by name on a venv (a failure has returned already): out of
-    // the manifest too, from every group declaring it.
-    if let Some((path, name)) = &unsave {
-        let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        match project::remove_dependency(path, name) {
-            Ok(groups) if groups.is_empty() => {}
-            Ok(groups) => log!(
-                "removed {name} from {file} {}",
-                groups.iter().map(|g| group_label(g)).collect::<Vec<_>>().join(", ")
-            ),
-            Err(e) => wlog!("{name} is uninstalled, but the manifest was not updated: {e:#}"),
-        }
-    }
+    // Only reached when the named package was removed: a failure of its own
+    // returned above, and one of a dependency edited the manifest on the way out.
+    unsave_now();
 
     // The same reason as on install, in reverse: the packages' `.mnu` files
     // are gone, but LabVIEW still shows the palette entries until told. Not
@@ -1478,6 +1488,13 @@ fn cmd_uninstall(
         failed.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
     );
     Ok(())
+}
+
+/// `names` starts with the package named on the command line, so a failure
+/// anywhere after the first position means that package is already gone and
+/// must not stay declared in the manifest; a failure of the first leaves it.
+fn named_package_removed_before(failed_at: usize) -> bool {
+    failed_at > 0
 }
 
 fn project_uninstall_roots(path: &Path) -> Result<Vec<String>> {
@@ -3619,6 +3636,13 @@ mod tests {
             launch_check_hint(&[hooks("a: PostInstall failed: x", "a")]),
             "`lvpm run-hooks a` reruns a's PostInstall hook; or `lvpm launch --no-check` to start anyway"
         );
+    }
+
+    #[test]
+    fn a_failed_dependency_leaves_the_named_package_removed_from_the_manifest() {
+        assert!(!named_package_removed_before(0));
+        assert!(named_package_removed_before(1));
+        assert!(named_package_removed_before(3));
     }
 
     #[test]
