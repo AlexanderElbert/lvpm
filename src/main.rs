@@ -1742,9 +1742,12 @@ fn cmd_install(
     let config = config::load()?;
     let package_cache = cache::Cache::open(&config.cache)?;
 
-    // Every archive is in hand before the first file is written: a download
+    // Every archive is fetched before the first file is written: a download
     // that fails then leaves the target as it was, instead of half installed
-    // with the earlier packages' PostInstall hooks never run.
+    // with the earlier packages' PostInstall hooks never run. Fetched, not
+    // held: the copy loop reads each one back from the cache (or its local
+    // file) when its turn comes, so memory holds one archive at a time. Only
+    // a download the cache cannot find again (no MD5) stays in hand.
     let mut archives: HashMap<String, Vec<u8>> = HashMap::new();
     {
         let wanted: Vec<&index::Entry> = plan
@@ -1760,7 +1763,9 @@ fn cmd_install(
         for e in &wanted {
             let bytes = fetch::package(&package_cache, &client, e)
                 .with_context(|| format!("{} {}: nothing was installed", e.name, e.version))?;
-            archives.insert(e.name.clone(), bytes);
+            if !fetch::rereadable(e) {
+                archives.insert(e.name.clone(), bytes);
+            }
         }
         if !wanted.is_empty() {
             log!("{}", took(started.elapsed()));
@@ -1833,7 +1838,10 @@ fn cmd_install(
         logp!("{} {} {} ... ", if dry_run { "?" } else { "+" }, e.name, e.version);
         std::io::stdout().flush().ok();
 
-        let bytes = archives.remove(&e.name).context("archive was not fetched")?;
+        let bytes = match archives.remove(&e.name) {
+            Some(bytes) => bytes,
+            None => fetch::package(&package_cache, &client, e)?,
+        };
 
         let mut zip = install::open_archive(bytes)?;
         let spec = spec::parse(&read_spec(&mut zip)?)?;
