@@ -1919,7 +1919,18 @@ fn cmd_install(
     // adds the packages it would install.
     let mut unknown_hooks = Vec::new();
     let mut owed = Vec::new();
-    for m in install::list_installed(&store)? {
+    // Lenient: a record this sweep cannot read is some other package's, and
+    // stopping here would leave what was just copied without linkfix, its
+    // manifest entry and its hooks.
+    let (records, unreadable) = install::list_installed_lenient(&store)?;
+    for (path, e) in &unreadable {
+        wlog!(
+            "\nwarning: cannot read the installation record {}: {e:#}\n      \
+             whether that package's post-install hook is owed is unknown; uninstall it with the lvpm that installed it",
+            path.display()
+        );
+    }
+    for m in records {
         match (&m.post_install_vi, &m.post_install) {
             (Some(vi), Some(install::HookState::Pending | install::HookState::Skipped { .. })) => {
                 owed.push((m.name, PathBuf::from(vi), m.files))

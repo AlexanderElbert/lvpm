@@ -139,21 +139,45 @@ pub fn read_manifest(roots: &Roots, name: &str) -> Result<Manifest> {
 }
 
 pub fn list_installed(roots: &Roots) -> Result<Vec<Manifest>> {
+    let (manifests, mut unreadable) = list_installed_lenient(roots)?;
+    match unreadable.is_empty() {
+        true => Ok(manifests),
+        false => Err(unreadable.remove(0).1),
+    }
+}
+
+/// Every record that reads, and each one that does not with the reason. For
+/// a command that only looks the records over (the install's sweep for owed
+/// hooks): one record from an older lvpm, or a damaged one, belongs to some
+/// other package and must not stop it. A command that acts on a record
+/// (`uninstall`, `list`, `run-hooks --all`) uses [`list_installed`], which
+/// refuses instead.
+pub fn list_installed_lenient(roots: &Roots) -> Result<(Vec<Manifest>, Vec<(PathBuf, anyhow::Error)>)> {
     let dir = roots.store_dir();
     if !dir.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let mut manifests = Vec::new();
+    let mut unreadable = Vec::new();
+    let mut paths = Vec::new();
     for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
-        let path = entry?.path();
+        paths.push(entry?.path());
+    }
+    paths.sort();
+    for path in paths {
         if path.extension().is_some_and(|ext| ext == "json") {
-            let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-            manifests.push(serde_json::from_str::<Manifest>(&text)
-                .with_context(|| format!("reading installation record {} (dependency list required)", path.display()))?);
+            let read = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display())).and_then(|text| {
+                serde_json::from_str::<Manifest>(&text)
+                    .with_context(|| format!("reading installation record {} (dependency list required)", path.display()))
+            });
+            match read {
+                Ok(m) => manifests.push(m),
+                Err(e) => unreadable.push((path, e)),
+            }
         }
     }
     manifests.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(manifests)
+    Ok((manifests, unreadable))
 }
 
 type Archive = zip::ZipArchive<std::io::Cursor<Vec<u8>>>;
@@ -505,6 +529,33 @@ mod tests {
         assert!(!dir.join("packages").join("example").exists());
         assert!(dir.join("packages").is_dir());
         assert!(dir.join("installed").is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_record_fails_the_strict_listing_and_is_set_aside_by_the_lenient_one() {
+        let dir = std::env::temp_dir().join(format!("lvpm-lenient-records-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Roots::scratch(&dir);
+        std::fs::create_dir_all(store.store_dir()).unwrap();
+        let good = r#"{"name":"good","version":"1","display_name":null,"installed_at":0,"target":"t",
+            "files":[],"dependencies":[],"skipped_hooks":[],"post_install_vi":"h.vi"}"#;
+        // Written by an lvpm from before records listed dependencies.
+        let legacy = r#"{"name":"legacy","version":"1","display_name":null,"installed_at":0,"target":"t",
+            "files":[],"skipped_hooks":[]}"#;
+        std::fs::write(manifest_path(&store, "good"), good).unwrap();
+        std::fs::write(manifest_path(&store, "legacy"), legacy).unwrap();
+        std::fs::write(manifest_path(&store, "broken"), "{ not json").unwrap();
+
+        let (read, unreadable) = list_installed_lenient(&store).unwrap();
+        assert_eq!(read.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["good"]);
+        let names: Vec<String> =
+            unreadable.iter().map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["broken.json", "legacy.json"]);
+        assert!(format!("{:#}", unreadable[1].1).contains("dependency list required"));
+
+        let err = list_installed(&store).unwrap_err();
+        assert!(format!("{err:#}").contains("broken.json"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
