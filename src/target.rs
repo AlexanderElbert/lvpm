@@ -60,13 +60,40 @@ impl LvTarget {
     }
 }
 
+/// The LabVIEW installations on this machine, newest first.
+pub fn detect() -> Result<Vec<LvTarget>> {
+    #[cfg(debug_assertions)]
+    if let Some(fake) = test_labview()? {
+        return Ok(vec![fake]);
+    }
+    detect_installed()
+}
+
+/// Tests only, and only in a debug build (what `cargo test` runs): with
+/// `LVPM_TEST_LABVIEW=<version>,<bitness>,<dir>` set, that folder is the one
+/// LabVIEW installed, so the venv workflow can be driven end to end on a
+/// machine without LabVIEW. A release build never reads it.
+#[cfg(debug_assertions)]
+fn test_labview() -> Result<Option<LvTarget>> {
+    let Some(spec) = std::env::var_os("LVPM_TEST_LABVIEW") else { return Ok(None) };
+    let spec = spec.to_string_lossy().into_owned();
+    let mut parts = spec.splitn(3, ',');
+    let (Some(version), Some(bitness), Some(dir)) = (parts.next(), parts.next(), parts.next()) else {
+        bail!("LVPM_TEST_LABVIEW is <version>,<bitness>,<dir>; got {spec:?}");
+    };
+    let (Ok(version), Ok(bitness)) = (version.trim().parse::<f64>(), bitness.trim().parse::<u8>()) else {
+        bail!("LVPM_TEST_LABVIEW is <version>,<bitness>,<dir>; got {spec:?}");
+    };
+    Ok(Some(LvTarget { version, bitness, path: PathBuf::from(dir) }))
+}
+
 #[cfg(windows)]
 const EXE: &str = "LabVIEW.exe";
 #[cfg(target_os = "linux")]
 const EXE: &str = "labview";
 
 #[cfg(windows)]
-pub fn detect() -> Result<Vec<LvTarget>> {
+fn detect_installed() -> Result<Vec<LvTarget>> {
     use winreg::RegKey;
     use winreg::enums::*;
 
@@ -105,7 +132,7 @@ pub fn detect() -> Result<Vec<LvTarget>> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn detect() -> Result<Vec<LvTarget>> {
+fn detect_installed() -> Result<Vec<LvTarget>> {
     // LabVIEW on Linux lives under /usr/local/natinst/LabVIEW-<year>-64 unless
     // its prefix was moved at install time; either way its package links
     // /etc/natinst/labview-<year>-64 to the install's `etc`, where

@@ -8,7 +8,7 @@ and what changes before it is called stable, are in [cli.md](cli.md).
 | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `lvpm install <name>[@<version>]`                    | Resolve dependencies, download, verify MD5, unpack, prepare links and source-only files, run hooks |
 | `lvpm install`                                       | Inside a project: install everything `lvpm.toml` lists, preparing links after the whole plan is copied (`--manifest <FILE>` selects a manifest) |
-| `lvpm linkfix` / `--tree <DIR>`                     | Prepare an existing venv or explicit LabVIEW-shaped tree; supports dry runs and per-file reports |
+| `lvpm linkfix` / `--tree <DIR>`                     | Prepare an existing venv or explicit LabVIEW-shaped tree; flags in [linkfix.md](linkfix.md) |
 | `lvpm uninstall <name>` / `--all`                    | Remove installed files; optionally remove unshared dependencies                                                                              |
 | `lvpm list`                                          | What lvpm has installed into the selected target, and which hooks it did not run                                                             |
 | `lvpm search <query>`                                | Search the package indexes                                                                                                                   |
@@ -42,8 +42,11 @@ and what changes before it is called stable, are in [cli.md](cli.md).
 installed package with an older version; `--no-linkfix` leaves package files
 as copied, skipping link repair and source-only preparation. `--relink` loads
 and saves VIs in LabVIEW **instead of linkfix** (off by default); the legacy
-`--no-relink` is accepted but does not disable linkfix. `--hooks` runs install
-hooks where they are off by default (both: a headless LabVIEW, see
+`--no-relink` is accepted but does not disable linkfix. Hooks are off by default
+in a venv and on a headless machine, and on by default in a LabVIEW
+installation; `--hooks` runs every package's hooks whatever the manifest says,
+`--no-hooks` runs none, and `hooks = "run"` or `"skip"` sets one package (see
+[the manifest](manifest.md#dependency-tables-hooks-and-relink) and
 [ci-container.md](ci-container.md)). `--relink-timeout <SECS>` (default 900)
 bounds one folder's relink; `--keep-open` leaves the LabVIEW started for a venv
 relink running.

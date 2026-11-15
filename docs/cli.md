@@ -24,7 +24,8 @@ Commands or flags marked hidden or under `debug` are not covered.
 ## Today
 
 ```text
-lvpm [--labview-version YYYY] [--prefix DIR | --project DIR] [--global] [--refresh] <command>
+lvpm [--labview-version YYYY] [--prefix DIR | --project DIR] [--global] [--refresh]
+     [--log-level LEVEL] <command>
 
   targets                       detected LabVIEW installations
   search <query>                search the indexes
@@ -32,16 +33,16 @@ lvpm [--labview-version YYYY] [--prefix DIR | --project DIR] [--global] [--refre
   install [<pkg>[@ver]] [--manifest FILE] [--dry-run] [--no-deps]
           [--no-linkfix] [--relink] [--no-hooks | --hooks] [--allow-downgrade]
           [--relink-timeout SECS] [--relink-progress NAME] [--keep-open]
-          [--no-save | --group G]
-  uninstall <pkg> [--no-save] | --all     [--with-deps | --keep-deps]
+          [--no-save | --group G] [--with G] [--without G] [--only G]
+  uninstall <pkg> [--no-save] | --all     [--with-deps | --keep-deps] [--force]
   relink <pkg> | --all          [--relink-timeout] [--relink-progress] [--keep-open]
-  linkfix [--tree DIR] [--dry-run] [--verbose] [--keep-compiled-code]
-     [--fix owner,paths,qualifiers,source-only] [--report FILE]
+  linkfix [--tree DIR] [--dry-run] [--verbose] [--keep-compiled-code] [--bitness 32|64]
+     [--fix owner,paths,qualifiers,source-only,clfn-wildcard] [--report FILE]
   run-hooks <pkg> | --all       [--timeout SECS]
   refresh                       [--timeout SECS]
   start                         [--wait SECS]
   launch [<lvproj>]             [--ini KEY=VALUE]... [--no-check]
-  venv create | status | remove [-y]
+  venv create [--manifest FILE] | status | remove [-y]
   config get <key> | set <key> [<value>...]
   cache add <path>
   import <vipm.toml | file.vipc> [--all] [--group G] [--dry-run]
@@ -67,18 +68,16 @@ proposals until the pull request that makes them.
 
 ### 1. Every command resolves its destination the same way
 
-Today `install`, `uninstall`, `list`, `relink`, `launch` and `vi-*` use the
-venv when there is one (`destination()`), but `start`, `refresh`,
-`run-hooks` and `app-probe` only look at `--labview-version` / `--prefix`
+Today `install`, `uninstall`, `list`, `relink`, `run-hooks`, `launch` and `vi-*`
+use the venv when there is one (`destination()`), but `start`, `refresh` and
+`app-probe` only look at `--labview-version` / `--prefix`
 (`roots_for()`). So inside a project, `lvpm start` starts the global
 LabVIEW while `lvpm launch` starts the venv's, and `lvpm refresh` without a
 flag fails.
 
 Proposed: every command that touches a target goes through one
 `Context` (`context.rs`). Where a command cannot act on a venv, it says so
-and names the alternative instead of failing on a missing flag. `run-hooks`
-in a venv refuses until hooks run in venvs (roadmap, *Install hooks in a
-venv*). Breaking: no; commands that failed now work.
+and names the alternative instead of failing on a missing flag. Breaking: no; commands that failed now work.
 
 ### 2. `--refresh` and `refresh` mean different things
 
@@ -94,9 +93,7 @@ It selects the LabVIEW for every command (`venv create`, `start`,
 `launch`, `vi-*`), but its help says "Install into this LabVIEW version".
 
 Proposed: help text "The LabVIEW to use, e.g. 2026"; add the short alias
-`--lv`. Settle the manifest key at the same time: `lvpm.toml` says
-`labview = "2025"` while the `venv create` help says "the manifest's
-`labview-version`". Keep `labview` and fix the help. Breaking: no.
+`--lv`. Breaking: no.
 
 ### 4. Debug commands out of the top level
 
@@ -131,9 +128,9 @@ changes, boundaries and inspection commands.
 The separate LabVIEW load/save pass is off by default and enabled by
 `--relink`, regardless of `LV_RTE_HEADLESS`. It replaces linkfix rather than
 running after it. The hidden legacy `--no-relink`
-is accepted and ignored; it does not disable linkfix. Hooks normally run on
-developer machines and are skipped headless unless `--hooks` is passed;
-`--no-hooks` disables them explicitly.
+is accepted and ignored; it does not disable linkfix. Hooks: a venv runs none unless the manifest says `hooks = "run"`, a LabVIEW
+installation runs all unless `hooks = "skip"`, and a headless machine runs only
+`hooks = "run"`; `--hooks` and `--no-hooks` override.
 
 Proposed: `--relink auto|always|never` and `--hooks auto|always|never`,
 `auto` would need an explicit policy; this proposal does not change the
@@ -175,8 +172,9 @@ to `uninstall --all` and `venv remove`. Breaking: an interactive
 
 ### 10. Output streams, verbosity and colour
 
-Today results go to stdout (110 `println!`), progress and the venv banner
-to stderr (12 `eprintln!`), but not consistently: progress lines inside
+Today output goes through the `log!` (stdout) and `elog!` (stderr) macros in
+`src/logging.rs`, which also write the log file. Results go to stdout, progress
+and the venv banner to stderr, but not consistently: progress lines inside
 `install` go to stdout.
 
 Proposed rule: stdout carries the result of the command and nothing else;

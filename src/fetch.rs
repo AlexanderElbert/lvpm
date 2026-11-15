@@ -18,6 +18,14 @@ use std::time::Duration;
 /// automatically reused on later requests. Local paths are not imported here.
 /// Cache population also occurs during dry runs; target writes are the caller's
 /// responsibility. Missing explicit cache entries fail instead of downloading.
+/// Whether a second [`package`] call for `entry` is served from disk: a
+/// cache entry or a local file is read again, and a download with an
+/// advertised MD5 is found in the cache by it. Only a download without one
+/// would go back to the network.
+pub fn rereadable(entry: &Entry) -> bool {
+    index::is_local_url(&entry.url) || entry.md5.is_some()
+}
+
 pub fn package(cache: &Cache, client: &Client, entry: &Entry) -> Result<Vec<u8>> {
     if let Some(sha256) = entry.url.strip_prefix("cache:") {
         let bytes = cache.load(sha256)?.with_context(|| format!(
@@ -201,6 +209,15 @@ mod tests {
         assert!(cache.imported_packages().unwrap().is_empty());
         drop(cache);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn only_a_download_without_an_md5_cannot_be_read_again_from_disk() {
+        let md5 = || Some(index::md5_hex(b"x"));
+        assert!(rereadable(&entry("https://host/package.vip".into(), md5())));
+        assert!(!rereadable(&entry("https://host/package.vip".into(), None)));
+        assert!(rereadable(&entry(format!("cache:{}", "0".repeat(64)), None)));
+        assert!(rereadable(&entry(r"D:\packages\package.vip".into(), None)));
     }
 
     #[test]

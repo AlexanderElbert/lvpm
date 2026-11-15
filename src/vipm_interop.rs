@@ -63,14 +63,16 @@ pub fn parse_toml(text: &str) -> Result<Converted> {
             "dependencies" => {
                 for (name, v) in table(&key, value)? {
                     let s = string(&key, &name, v)?;
-                    project.dependencies.push((name, exact(&key, &s)?));
+                    let c = exact(&key, &name, &s)?;
+                    project.dependencies.push((name, c));
                 }
             }
             "dev-dependencies" => {
                 let mut dev = Group::default();
                 for (name, v) in table(&key, value)? {
                     let s = string(&key, &name, v)?;
-                    dev.dependencies.push((name, exact(&key, &s)?));
+                    let c = exact(&key, &name, &s)?;
+                    dev.dependencies.push((name, c));
                 }
                 project.groups.push((DEV_GROUP.to_string(), dev));
             }
@@ -107,11 +109,12 @@ fn string(table: &str, key: &str, value: toml::Value) -> Result<String> {
 }
 
 /// VIPM writes exact versions only and rejects empty ones.
-fn exact(table: &str, version: &str) -> Result<Constraint> {
+fn exact(table: &str, name: &str, version: &str) -> Result<Constraint> {
     let v = version.trim();
     if v.is_empty() || v.starts_with(['<', '>', '=', '~', '^', '*']) {
         bail!("[{table}] {version:?}: vipm.toml requires an exact version, e.g. \"1.2.3.4\"");
     }
+    ensure!(crate::version::is_version(v), "[{table}] {name}: {version:?} is not a version, e.g. \"1.2.3.4\"");
     Ok(Constraint::Exact(Version::parse(v)))
 }
 
@@ -150,9 +153,44 @@ pub struct Vipc {
     /// Bundled specs that could not be read; their packages count as having
     /// no dependencies.
     pub unreadable_specs: Vec<String>,
+    /// `config.xml` entries whose name carries no version (`foo`,
+    /// `foo-beta`): left out, so one of them does not cost the rest.
+    pub unversioned: Vec<String>,
+}
+
+/// A package carried in a `.vipc` that is not the one `config.xml` lists.
+#[derive(Debug, PartialEq)]
+pub struct Mismatch {
+    /// The archive's member name in the `.vipc`.
+    pub member: String,
+    /// Name and version as `config.xml` lists them.
+    pub listed: (String, String),
+    /// Name and version the archive's own spec gives.
+    pub actual: (String, String),
 }
 
 impl Vipc {
+    /// Name each carried package the way its own archive does, and return
+    /// those `config.xml` listed differently. The archive is what goes into
+    /// the cache and what an install unpacks, under the name and version in
+    /// its spec; a manifest pinning `config.xml`'s reading of it would ask
+    /// for a version that is not there.
+    pub fn follow_embedded(&mut self) -> Result<Vec<Mismatch>> {
+        let mut mismatches = Vec::new();
+        for p in &mut self.packages {
+            let Some((member, bytes)) = &p.embedded else { continue };
+            let (name, version) = crate::index::package_identity(bytes).with_context(|| format!("reading {member}"))?;
+            if !name.eq_ignore_ascii_case(&p.name) || Version::parse(&version) != Version::parse(&p.version) {
+                mismatches.push(Mismatch {
+                    member: member.clone(),
+                    listed: (std::mem::replace(&mut p.name, name.clone()), std::mem::replace(&mut p.version, version.clone())),
+                    actual: (name, version),
+                });
+            }
+        }
+        Ok(mismatches)
+    }
+
     /// The packages nothing else in the file requires, in file order: what
     /// a project would list by hand. VIPM's own `Dependency` flag does not say
     /// this (it disagrees with the specs in 20 of 25 files checked), so the
@@ -225,10 +263,11 @@ pub fn parse_vipc(bytes: &[u8]) -> Result<Vipc> {
 
     let mut packages = Vec::new();
     let mut unreadable_specs = Vec::new();
+    let mut unversioned = Vec::new();
     for (id, included) in listed {
-        let (name, version) = match crate::version::split_id(&id) {
-            Some((n, v)) => (n, v.raw),
-            None => bail!("package {id:?} in config.xml has no version"),
+        let Some((name, version)) = crate::version::split_id(&id).map(|(n, v)| (n, v.raw)) else {
+            unversioned.push(id);
+            continue;
         };
         let spec_name = format!("{id}.spec");
         let requires = match member(&mut zip, &spec_name)? {
@@ -268,7 +307,7 @@ pub fn parse_vipc(bytes: &[u8]) -> Result<Vipc> {
         packages.push(VipcPackage { name, version, requires, embedded });
     }
     let labview = target.as_deref().and_then(labview_year);
-    Ok(Vipc { target, labview, packages, unreadable_specs })
+    Ok(Vipc { target, labview, packages, unreadable_specs, unversioned })
 }
 
 /// A zip member by name (case-insensitive, as VIPM writes on Windows).
@@ -467,6 +506,13 @@ path = "InstrumentControl.vipb"
             assert!(parse_toml(&text).is_err(), "{bad} should be rejected");
         }
         assert!(parse_toml("[dependencies]\noglib_array = 6.0\n").is_err(), "unquoted");
+        for bad in ["latest", "v1.0", "skip", "run"] {
+            let e = parse_toml(&format!("[dependencies]\nfoo = \"{bad}\"\n")).unwrap_err().to_string();
+            assert_eq!(e, format!("[dependencies] foo: \"{bad}\" is not a version, e.g. \"1.2.3.4\""));
+        }
+        for good in ["1.0.1-1", "2018.0.7.45", "7.1.2.1547", "1.0.0b3"] {
+            assert!(parse_toml(&format!("[dependencies]\nfoo = \"{good}\"\n")).is_ok(), "{good}");
+        }
     }
 
     #[test]
@@ -602,6 +648,49 @@ path = "InstrumentControl.vipb"
         assert!(std::str::from_utf8(&cfg).is_err());
         let v = parse_vipc(&vipc(&cfg, &[("x-1.0", &spec("x", "1.0", ""))], &[])).unwrap();
         assert_eq!(v.packages.len(), 1);
+    }
+
+    #[test]
+    fn a_carried_package_is_named_by_its_own_spec_when_config_xml_disagrees() {
+        let cfg = config("24.3 (64-bit)", &[("same-1.0.0.1", true), ("rebuilt-1.0.0.1", true), ("listed_only-2.0", false)]);
+        let bytes = vipc(
+            cfg.as_bytes(),
+            &[],
+            &[("same-1.0.0.1.vip", &spec("Same", "1.0.0.1", "")), ("rebuilt-1.0.0.1.vip", &spec("rebuilt", "1.0.0.2", ""))],
+        );
+        let mut v = parse_vipc(&bytes).unwrap();
+        let mismatches = v.follow_embedded().unwrap();
+        assert_eq!(
+            mismatches,
+            [Mismatch {
+                member: "rebuilt-1.0.0.1.vip".into(),
+                listed: ("rebuilt".into(), "1.0.0.1".into()),
+                actual: ("rebuilt".into(), "1.0.0.2".into()),
+            }]
+        );
+        let pins: Vec<(&str, &str)> = v.packages.iter().map(|p| (p.name.as_str(), p.version.as_str())).collect();
+        assert_eq!(pins, [("same", "1.0.0.1"), ("rebuilt", "1.0.0.2"), ("listed_only", "2.0")], "a name differing only in case is the same package");
+
+        // A carried file that is not a package stops the import before anything is written.
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        use std::io::Write;
+        w.start_file("config.xml", opts).unwrap();
+        w.write_all(config("24.3", &[("junk-1.0", true)]).as_bytes()).unwrap();
+        w.start_file("junk-1.0.vip", opts).unwrap();
+        w.write_all(b"not a zip").unwrap();
+        let mut v = parse_vipc(&w.finish().unwrap().into_inner()).unwrap();
+        let err = format!("{:#}", v.follow_embedded().unwrap_err());
+        assert!(err.contains("junk-1.0.vip"), "{err}");
+    }
+
+    #[test]
+    fn an_entry_without_a_version_is_set_aside_and_the_rest_still_read() {
+        let cfg = config("25.3 (64-bit)", &[("good-1.0.0.1", false), ("foo", false), ("foo-beta", false)]);
+        let v = parse_vipc(&vipc(cfg.as_bytes(), &[("good-1.0.0.1", &spec("good", "1.0.0.1", ""))], &[])).unwrap();
+        assert_eq!(names(&v, &v.roots()), ["good"]);
+        assert_eq!(v.unversioned, ["foo", "foo-beta"]);
+        assert!(v.unreadable_specs.is_empty(), "an entry left out is not also reported for its spec");
     }
 
     #[test]

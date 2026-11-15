@@ -38,7 +38,7 @@ on one line and each overridable (the relink pass is off on both, behind
 |                                    | developer's machine                                                                 | headless (`LV_RTE_HEADLESS`)                                                                                                         | override                         |
 | ---------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------- |
 | `lvpm.toml` with no venv beside it | refused: a developer inside a project must not install into the machine by accident | the machine is the sandbox: install into the LabVIEW the manifest's `labview` names (a newer one may stand in, an older one may not) | `--labview-version`, `--project` |
-| install hooks                      | run, before and after the files                                                     | skipped, and `lvpm list` says so: the hooks measured write a marker file and add a palette entry, IDE furniture                      | `--hooks`                        |
+| install hooks                      | run for an install into the LabVIEW installation, not in a venv                     | skipped, and `lvpm list` says so: the hooks measured write a marker file and add a palette entry, IDE furniture                      | `--hooks`, or `hooks = "run"` per package in the manifest |
 | palettes and menus                 | rebuilt after the install                                                           | not rebuilt: no one sees a palette                                                                                                   | `lvpm refresh`                   |
 
 Together those mean a headless `lvpm install` never starts LabVIEW: it is
@@ -48,10 +48,12 @@ two minutes with hooks, twelve with relink as well, and the mass
 compile afterwards reported nothing wrong either way.
 
 The hook skip is the one with a caveat. A hook is arbitrary LabVIEW code,
-and a few packages do real setup in theirs: NI's HTTP client, for one, does
-not open a session until its PostInstall has run. If a package behaves
+and a few packages do real setup in theirs. The one hook measured as needed,
+NI's Advanced HTTP Client's, is now covered by linkfix (see
+[install-process.md](install-process.md#script-vi-hooks)). If a package behaves
 differently in the container than on your machine, `--hooks` is the first
-thing to try; it starts a headless LabVIEW for them. `--relink` likewise
+thing to try; it starts a headless LabVIEW for them. `hooks = "run"` for that
+package in the manifest is the narrower alternative. `--relink` likewise
 when the job's output _is_ relinked packages.
 
 ## Linux

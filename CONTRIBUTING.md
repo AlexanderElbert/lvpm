@@ -47,6 +47,17 @@ After the bootstrap finishes:
 
 This is required for the default `x86_64-pc-windows-msvc` Rust target; the bootstrap alone does not install the actual linker toolchain.
 
+## Tests
+
+`cargo test` runs the unit tests and the integration tests in `tests/`.
+`tests/venv.rs` drives the venv workflow end to end through the lvpm binary
+(create, install, the manifest, uninstall, groups, the launch check,
+shadowing, import, the log) without LabVIEW: a debug build of lvpm takes
+`LVPM_TEST_LABVIEW=<version>,<bitness>,<dir>` as the one LabVIEW installed,
+and each test makes a fake one. A release build never reads it. What needs a
+running LabVIEW (relink, hooks, the overlay loading) is covered by the
+container suite in `e2e/`, which CI runs on every push.
+
 ## Contribution workflow
 
 - Keep changes focused and easy to review.

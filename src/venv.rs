@@ -221,6 +221,22 @@ pub fn project_manifest(project: Option<&Path>, cwd: &Path) -> Result<Option<Pat
     Ok((project.is_some() || path.is_file()).then_some(path))
 }
 
+/// Bind the venv of the project at `repo` to the manifest `name` beside it,
+/// leaving the rest of the binding and everything installed as it is. For a
+/// venv created from a `vipm.toml`, which `lvpm import` moves to the
+/// `lvpm.toml` it writes.
+pub fn rebind_manifest(repo: &Path, name: &str) -> Result<()> {
+    let bp = binding_path(&repo.join(config::load()?.venv_dir));
+    rebind_manifest_at(&bp, name)
+}
+
+fn rebind_manifest_at(bp: &Path, name: &str) -> Result<()> {
+    let text = std::fs::read_to_string(bp).with_context(|| format!("reading {}", bp.display()))?;
+    let mut b: Binding = serde_json::from_str(&text).with_context(|| format!("reading {}", bp.display()))?;
+    b.manifest = Some(PathBuf::from(name));
+    std::fs::write(bp, serde_json::to_string_pretty(&b)?).with_context(|| format!("writing {}", bp.display()))
+}
+
 /// The venv a command means, if any: `--project` names the repo outright,
 /// otherwise it is looked up from `cwd`.
 pub fn find(project: Option<&Path>, cwd: &Path) -> Result<Option<Venv>> {
@@ -510,6 +526,20 @@ mod tests {
         let stored = serde_json::to_string(&binding).unwrap();
         let restored: Binding = serde_json::from_str(&stored).unwrap();
         assert_eq!(restored.manifest, Some(PathBuf::from("vipm.toml")));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rebinding_changes_the_manifest_and_nothing_else() {
+        let repo = scratch_dir("rebind");
+        let bp = binding_path(&repo);
+        let old = r#"{"target_key":"k","target_path":"p","version":26.3,"bitness":64,"port":3500,"created_at":7,"manifest":"vipm.toml"}"#;
+        std::fs::write(&bp, old).unwrap();
+        rebind_manifest_at(&bp, project::FILE_NAME).unwrap();
+        let b: Binding = serde_json::from_str(&std::fs::read_to_string(&bp).unwrap()).unwrap();
+        assert_eq!(b.manifest, Some(PathBuf::from("lvpm.toml")));
+        assert_eq!((b.target_key.as_str(), b.target_path.as_str(), b.bitness, b.port, b.created_at), ("k", "p", 64, 3500, 7));
+        assert!(rebind_manifest_at(&repo.join("absent.json"), "lvpm.toml").is_err());
         let _ = std::fs::remove_dir_all(&repo);
     }
 
