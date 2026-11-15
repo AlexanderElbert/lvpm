@@ -61,16 +61,26 @@ pub enum Constraint {
     Any,
 }
 
+/// A version number as written, or an error. `Version::parse` takes anything
+/// (a word becomes 0), so without this `foo = "latest"` would pin a version
+/// no index has.
+fn checked(v: &str) -> Result<&str> {
+    if !crate::version::is_version(v) {
+        bail!("{v:?} is not a version, e.g. \"1.2.3.4\"");
+    }
+    Ok(v)
+}
+
 impl Constraint {
     pub fn parse(s: &str) -> Result<Constraint> {
         let s = s.trim();
         Ok(match s {
             "" | "*" => Constraint::Any,
-            _ if s.starts_with(">=") => Constraint::AtLeast(Version::parse(s[2..].trim())),
+            _ if s.starts_with(">=") => Constraint::AtLeast(Version::parse(checked(s[2..].trim())?)),
             _ if s.starts_with(['<', '>', '=', '~', '^']) => bail!(
                 "unsupported version constraint {s:?} — use an exact version, \">=x.y\" or \"*\""
             ),
-            _ => Constraint::Exact(Version::parse(s)),
+            _ => Constraint::Exact(Version::parse(checked(s)?)),
         })
     }
 
@@ -797,6 +807,22 @@ ni-daqmx-labview-support = "26.0.0.49434-0+f282"
         assert!(Constraint::parse("~1.2").is_err());
         assert!(Constraint::parse("<2").is_err());
         assert!(Constraint::parse("=1.2").is_err());
+    }
+
+    #[test]
+    fn versions_that_are_not_versions_are_rejected() {
+        for bad in ["latest", "v1.0", "skip", "run", ">=abc", ">=", "1.0 beta"] {
+            assert!(Constraint::parse(bad).is_err(), "{bad:?}");
+        }
+        let e = Constraint::parse("latest").unwrap_err().to_string();
+        assert_eq!(e, "\"latest\" is not a version, e.g. \"1.2.3.4\"");
+        for good in ["1.0.1-1", "2018.0.7.45", ">=6.0.1", "7.1.2.1547", "*", "", "1.0.0b3", ">= 1.0.0b3"] {
+            assert!(Constraint::parse(good).is_ok(), "{good:?}");
+        }
+        let err = parse("[dependencies]
+foo = \"latest\"
+").unwrap_err();
+        assert!(format!("{err:#}").contains("[dependencies] foo"), "{err:#}");
         assert_eq!(Constraint::parse("1.2").unwrap().to_string(), "@1.2");
         assert_eq!(Constraint::parse(">=1.2").unwrap().to_string(), " >=1.2");
         assert_eq!(Constraint::parse("*").unwrap().to_string(), "");

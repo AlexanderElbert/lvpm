@@ -63,14 +63,16 @@ pub fn parse_toml(text: &str) -> Result<Converted> {
             "dependencies" => {
                 for (name, v) in table(&key, value)? {
                     let s = string(&key, &name, v)?;
-                    project.dependencies.push((name, exact(&key, &s)?));
+                    let c = exact(&key, &name, &s)?;
+                    project.dependencies.push((name, c));
                 }
             }
             "dev-dependencies" => {
                 let mut dev = Group::default();
                 for (name, v) in table(&key, value)? {
                     let s = string(&key, &name, v)?;
-                    dev.dependencies.push((name, exact(&key, &s)?));
+                    let c = exact(&key, &name, &s)?;
+                    dev.dependencies.push((name, c));
                 }
                 project.groups.push((DEV_GROUP.to_string(), dev));
             }
@@ -107,11 +109,12 @@ fn string(table: &str, key: &str, value: toml::Value) -> Result<String> {
 }
 
 /// VIPM writes exact versions only and rejects empty ones.
-fn exact(table: &str, version: &str) -> Result<Constraint> {
+fn exact(table: &str, name: &str, version: &str) -> Result<Constraint> {
     let v = version.trim();
     if v.is_empty() || v.starts_with(['<', '>', '=', '~', '^', '*']) {
         bail!("[{table}] {version:?}: vipm.toml requires an exact version, e.g. \"1.2.3.4\"");
     }
+    ensure!(crate::version::is_version(v), "[{table}] {name}: {version:?} is not a version, e.g. \"1.2.3.4\"");
     Ok(Constraint::Exact(Version::parse(v)))
 }
 
@@ -503,6 +506,13 @@ path = "InstrumentControl.vipb"
             assert!(parse_toml(&text).is_err(), "{bad} should be rejected");
         }
         assert!(parse_toml("[dependencies]\noglib_array = 6.0\n").is_err(), "unquoted");
+        for bad in ["latest", "v1.0", "skip", "run"] {
+            let e = parse_toml(&format!("[dependencies]\nfoo = \"{bad}\"\n")).unwrap_err().to_string();
+            assert_eq!(e, format!("[dependencies] foo: \"{bad}\" is not a version, e.g. \"1.2.3.4\""));
+        }
+        for good in ["1.0.1-1", "2018.0.7.45", "7.1.2.1547", "1.0.0b3"] {
+            assert!(parse_toml(&format!("[dependencies]\nfoo = \"{good}\"\n")).is_ok(), "{good}");
+        }
     }
 
     #[test]

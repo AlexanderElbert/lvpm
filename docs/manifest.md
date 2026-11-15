@@ -120,7 +120,8 @@ Rules:
   form is a dependency table (below).
 - Versions compare component by component the way VIPM numbers them
   (`major.minor.patch.build`); odd but real forms such as `1.0.1-1` are
-  accepted as written.
+  accepted as written. A value that is not a version, such as `"latest"` or
+  `"v1.0"`, is rejected with an error naming the dependency.
 - Other operators (`<`, `=`, `~`, `^`, ranges) are rejected with an error
   naming the dependency, rather than misread.
 - The install plan lists dependencies before the packages that need them.
