@@ -2726,15 +2726,49 @@ fn check_venv_for_launch(cli: &Cli, dest: &Destination, v: &venv::Venv) -> Resul
         return Ok(());
     }
     let mut msg = format!("the venv does not match {}:", path.display());
-    for p in &problems {
+    for (p, _) in &problems {
         msg.push_str("\n  ");
         msg.push_str(p);
     }
-    msg.push_str("\nrun `lvpm install` to bring it in line, or `lvpm launch --no-check` to start anyway");
+    msg.push('\n');
+    msg.push_str(&launch_check_hint(&problems));
     bail!(msg)
 }
 
-/// Every way the installed records fall short of `wanted`, one line each.
+/// The command that clears a launch-check problem. `lvpm install` only picks
+/// up hooks that are `Pending` or `Skipped`, so a failed or unknown hook
+/// needs `run-hooks`.
+#[derive(Debug, PartialEq, Eq)]
+enum Fix {
+    Install,
+    RunHooks(String),
+}
+
+/// The closing line(s) of the launch refusal: only the commands that fix
+/// something that was reported, then the way to skip the check.
+fn launch_check_hint(problems: &[(String, Fix)]) -> String {
+    let mut hooks: Vec<&str> = Vec::new();
+    for (_, fix) in problems {
+        if let Fix::RunHooks(name) = fix
+            && !hooks.contains(&name.as_str())
+        {
+            hooks.push(name);
+        }
+    }
+    let mut lines = Vec::new();
+    if problems.iter().any(|(_, f)| *f == Fix::Install) {
+        lines.push("run `lvpm install` to bring it in line".to_string());
+    }
+    if !hooks.is_empty() {
+        let each: Vec<String> = hooks.iter().map(|n| format!("`lvpm run-hooks {n}` reruns {n}'s PostInstall hook")).collect();
+        lines.push(each.join(", "));
+    }
+    lines.push("or `lvpm launch --no-check` to start anyway".to_string());
+    lines.join("; ")
+}
+
+/// Every way the installed records fall short of `wanted`, one line each,
+/// with the command that fixes it.
 /// `hooks_run` says whether the hook policy runs a package's hooks here;
 /// `record` reads a package's install record, `None` when there is none.
 fn venv_problems(
@@ -2743,31 +2777,35 @@ fn venv_problems(
     hooks_run: impl Fn(&str) -> bool,
     record: impl Fn(&str) -> Result<Option<install::Manifest>>,
     exists: impl Fn(&Path) -> bool,
-) -> Result<Vec<String>> {
+) -> Result<Vec<(String, Fix)>> {
     let mut problems = Vec::new();
     for (name, constraint) in wanted {
         let Some(m) = record(name)? else {
-            problems.push(format!("{name}: not installed"));
+            problems.push((format!("{name}: not installed"), Fix::Install));
             continue;
         };
         if !constraint.allows(&Version::parse(&m.version)) {
-            problems.push(format!("{name}: {} installed, manifest asks for {name}{constraint}", m.version));
+            problems.push((format!("{name}: {} installed, manifest asks for {name}{constraint}", m.version), Fix::Install));
         }
         let missing: Vec<&String> = m.files.iter().filter(|f| !exists(Path::new(f.as_str()))).collect();
         if let Some(first) = missing.first() {
-            problems.push(format!("{name}: {} of {} files missing, e.g. {first}", missing.len(), m.files.len()));
+            problems.push((format!("{name}: {} of {} files missing, e.g. {first}", missing.len(), m.files.len()), Fix::Install));
         }
         let wants_relink = relink.iter().any(|(n, on)| *on && n.eq_ignore_ascii_case(name));
         if wants_relink && !m.relinked {
-            problems.push(format!("{name}: relink = true but the relink pass has not completed"));
+            problems.push((format!("{name}: relink = true but the relink pass has not completed"), Fix::Install));
         }
         if m.post_install_vi.is_some() {
             match &m.post_install {
                 Some(install::HookState::Failed { error, .. }) => {
-                    problems.push(format!("{name}: PostInstall failed: {error}"))
+                    problems.push((format!("{name}: PostInstall failed: {error}"), Fix::RunHooks(name.clone())))
                 }
                 Some(install::HookState::Ran { .. }) => {}
-                _ if hooks_run(name) => problems.push(format!("{name}: PostInstall has not run")),
+                // An install sweep runs these two; a record without a state is from an older lvpm and only run-hooks reaches it.
+                Some(install::HookState::Pending | install::HookState::Skipped { .. }) if hooks_run(name) => {
+                    problems.push((format!("{name}: PostInstall has not run"), Fix::Install))
+                }
+                None if hooks_run(name) => problems.push((format!("{name}: PostInstall has not run"), Fix::RunHooks(name.clone()))),
                 _ => {}
             }
         }
@@ -3522,7 +3560,7 @@ mod tests {
         let p = project::parse(
             "[dependencies]\nok = \">=1.0\"\nold = \"2.0\"\ngone = \"1\"\nhalf = \"1\"\n\
              rl = { version = \"1\", relink = true }\nhook = { version = \"1\", hooks = \"run\" }\n\
-             broke = \"1\"\nquiet = \"1\"\n",
+             broke = \"1\"\nquiet = \"1\"\nlegacy = \"1\"\nowed = \"1\"\n",
         )
         .unwrap();
         let read = |name: &str| -> Result<Option<install::Manifest>> {
@@ -3537,6 +3575,9 @@ mod tests {
                     "1",
                     r#","post_install_vi":"x","post_install":{"state":"failed","at":1,"error":"boom"}"#,
                 )),
+                // A record from an older lvpm: a hook, but no state.
+                "legacy" => Some(record(name, "1", r#","post_install_vi":"x""#)),
+                "owed" => Some(record(name, "1", r#","post_install_vi":"x","post_install":{"state":"pending"}"#)),
                 // Skipped by policy, and the policy says so: fine.
                 "quiet" => Some(record(name, "1", r#","post_install_vi":"x","post_install":{"state":"skipped","at":1}"#)),
                 _ => None,
@@ -3545,21 +3586,38 @@ mod tests {
         let problems = venv_problems(
             &p.dependencies,
             &p.relink,
-            |n| n == "hook",
+            |n| matches!(n, "hook" | "legacy" | "owed"),
             read,
             |path| path != Path::new("/v/half/b.vi"),
         )
         .unwrap();
+        let install = |s: &str| (s.to_string(), Fix::Install);
+        let hooks = |s: &str, n: &str| (s.to_string(), Fix::RunHooks(n.to_string()));
         assert_eq!(
             problems,
             vec![
-                "old: 1.9 installed, manifest asks for old@2.0",
-                "gone: not installed",
-                "half: 1 of 2 files missing, e.g. /v/half/b.vi",
-                "rl: relink = true but the relink pass has not completed",
-                "hook: PostInstall has not run",
-                "broke: PostInstall failed: boom",
+                install("old: 1.9 installed, manifest asks for old@2.0"),
+                install("gone: not installed"),
+                install("half: 1 of 2 files missing, e.g. /v/half/b.vi"),
+                install("rl: relink = true but the relink pass has not completed"),
+                install("hook: PostInstall has not run"),
+                hooks("broke: PostInstall failed: boom", "broke"),
+                hooks("legacy: PostInstall has not run", "legacy"),
+                install("owed: PostInstall has not run"),
             ]
+        );
+        assert_eq!(
+            launch_check_hint(&problems),
+            "run `lvpm install` to bring it in line; `lvpm run-hooks broke` reruns broke's PostInstall hook, \
+             `lvpm run-hooks legacy` reruns legacy's PostInstall hook; or `lvpm launch --no-check` to start anyway"
+        );
+        assert_eq!(
+            launch_check_hint(&[install("a: not installed")]),
+            "run `lvpm install` to bring it in line; or `lvpm launch --no-check` to start anyway"
+        );
+        assert_eq!(
+            launch_check_hint(&[hooks("a: PostInstall failed: x", "a")]),
+            "`lvpm run-hooks a` reruns a's PostInstall hook; or `lvpm launch --no-check` to start anyway"
         );
     }
 
