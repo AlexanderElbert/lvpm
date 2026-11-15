@@ -1215,7 +1215,12 @@ fn cmd_list(cli: &Cli) -> Result<()> {
         log!("lvpm has installed nothing into this target");
         return Ok(());
     }
-    let policy = hook_policy_for(&dest, HookMode::Default);
+    // Listing still works with a manifest that does not read: the owed count
+    // then follows the destination's defaults, and says so.
+    let policy = hook_policy_for(cli, &dest, HookMode::Default).unwrap_or_else(|e| {
+        wlog!("warning: {e:#}\n      hooks owed are counted without the manifest's `hooks` settings");
+        HookPolicy::new(HookMode::Default, matches!(dest, Destination::Venv(_)), None)
+    });
     let mut owed = 0;
     for m in &installed {
         let post = match (&m.post_install_vi, &m.post_install) {
@@ -1252,13 +1257,20 @@ fn cmd_list(cli: &Cli) -> Result<()> {
 }
 
 /// The hook policy for a command that is not an install: the destination's
-/// default and, in a venv, its bound manifest's `hooks` settings.
-fn hook_policy_for(dest: &Destination, mode: HookMode) -> HookPolicy {
+/// default and the `hooks` settings of the manifest an install there would
+/// follow — a venv's bound manifest, else `--project`'s or the nearest
+/// `lvpm.toml` (see [`manifest_for`]). A manifest that is there and cannot be
+/// read is an error, not a silent return to the defaults: those would run
+/// hooks the manifest opts out of.
+fn hook_policy_for(cli: &Cli, dest: &Destination, mode: HookMode) -> Result<HookPolicy> {
     let manifest = match dest {
-        Destination::Venv(v) => v.manifest_path().filter(|p| p.is_file()).and_then(|p| read_manifest(&p).ok()),
-        _ => None,
+        Destination::Venv(v) => match v.manifest_path().filter(|p| p.is_file()) {
+            Some(p) => Some(read_manifest(&p)?),
+            None => None,
+        },
+        _ => manifest_for(cli, None, None)?.map(|(_, p)| p),
     };
-    HookPolicy::new(mode, matches!(dest, Destination::Venv(_)), manifest.as_ref())
+    Ok(HookPolicy::new(mode, matches!(dest, Destination::Venv(_)), manifest.as_ref()))
 }
 
 fn cmd_refresh(cli: &Cli, timeout: u64) -> Result<()> {
@@ -2048,8 +2060,7 @@ fn cmd_install(
         }
         // The manifest never names a version the venv does not hold.
         (Some(SaveEntry::Kept { name, installed, resolved }), Some(v)) => log!(
-            "
-{} not changed: {name} {installed} stays installed (`--allow-downgrade` installs {resolved})",
+            "\n{} not changed: {name} {installed} stays installed (`--allow-downgrade` installs {resolved})",
             v.manifest_path().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| "the manifest".into())
         ),
         _ => {}
@@ -2225,7 +2236,7 @@ fn cmd_run_hooks(cli: &Cli, package: Option<&str>, all: bool, timeout: u64) -> R
         manifests.into_iter().filter(|m| m.post_install_vi.is_some()).collect();
     // `--all` follows the hook policy; a package named here is run as asked.
     if all {
-        let policy = hook_policy_for(&dest, HookMode::Default);
+        let policy = hook_policy_for(cli, &dest, HookMode::Default)?;
         let (allowed, held): (Vec<_>, Vec<_>) = work.into_iter().partition(|m| policy.allows(&m.name));
         if !held.is_empty() {
             log!(
@@ -2633,7 +2644,7 @@ fn cmd_venv(cli: &Cli, sub: &VenvCmd) -> Result<()> {
 /// Refuse to start LabVIEW on a venv that does not hold what the manifest's
 /// `[dependencies]` ask for. Reads only the install records: a file edited or
 /// resaved since install goes unnoticed (that needs hashes at install time).
-fn check_venv_for_launch(dest: &Destination, v: &venv::Venv) -> Result<()> {
+fn check_venv_for_launch(cli: &Cli, dest: &Destination, v: &venv::Venv) -> Result<()> {
     let Some(path) = v.manifest_path().filter(|p| p.is_file()) else {
         elog!("venv has no bound manifest — skipping the package check");
         return Ok(());
@@ -2643,7 +2654,7 @@ fn check_venv_for_launch(dest: &Destination, v: &venv::Venv) -> Result<()> {
     // recorded, so their absence cannot be told from a choice.
     let wanted = proj.select(&[], &[], &[])?.dependencies;
     let store = v.store();
-    let policy = hook_policy_for(dest, HookMode::Default);
+    let policy = hook_policy_for(cli, dest, HookMode::Default)?;
     let problems = venv_problems(
         &wanted,
         &proj.relink,
@@ -2715,7 +2726,7 @@ fn cmd_launch(cli: &Cli, lvproj: Option<&Path>, ini_keys: &[String], no_check: b
     };
     let v = v.clone();
     if !no_check {
-        check_venv_for_launch(&dest, &v)?;
+        check_venv_for_launch(cli, &dest, &v)?;
     }
     // Not a reason to refuse: the copies may be the same version. But the
     // user should know which one LabVIEW is about to load.
@@ -3278,6 +3289,45 @@ mod tests {
 
         assert!(!policy(HookMode::Never, false, false).allows("http"), "--no-hooks wins");
         assert!(policy(HookMode::Always, true, false).allows("gcli"), "--hooks wins");
+    }
+
+    #[test]
+    fn hook_policy_outside_an_install_reads_the_manifest_an_install_would() {
+        let dir = std::env::temp_dir().join(format!("lvpm-hook-policy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("lvpm.toml");
+        std::fs::write(&manifest, "[dependencies]\ngcli = { version = \"1\", hooks = \"skip\" }\nhttp = { version = \"1\", hooks = \"run\" }\n").unwrap();
+        let cli = Cli::try_parse_from(["lvpm", "--project", dir.to_str().unwrap(), "list"]).unwrap();
+        let setting = |p: &HookPolicy, name: &str| p.setting(name);
+
+        // The LabVIEW installation: `--project`'s manifest, as install reads it.
+        let global = Destination::Global(Roots::scratch(&dir));
+        let policy = hook_policy_for(&cli, &global, HookMode::Default).unwrap();
+        assert!(!policy.venv);
+        assert!(matches!(setting(&policy, "gcli"), Some(project::Hooks::Skip)));
+        assert!(matches!(setting(&policy, "HTTP"), Some(project::Hooks::Run)));
+        assert!(setting(&policy, "other").is_none());
+
+        // A venv: its bound manifest.
+        let mut v = venv::Venv {
+            repo: dir.clone(), dir: dir.join(".lv-venv"),
+            target: target::LvTarget { version: 26.3, bitness: 64, path: dir.join("LabVIEW") },
+            port: 3456, manifest: Some(PathBuf::from("lvpm.toml")),
+        };
+        let policy = hook_policy_for(&cli, &Destination::Venv(v.clone()), HookMode::Default).unwrap();
+        assert!(policy.venv && matches!(setting(&policy, "gcli"), Some(project::Hooks::Skip)));
+
+        // A manifest that does not read is an error, not the defaults.
+        std::fs::write(&manifest, "[dependencies]\ngcli = 1\n").unwrap();
+        assert!(hook_policy_for(&cli, &global, HookMode::Default).is_err());
+        assert!(hook_policy_for(&cli, &Destination::Venv(v.clone()), HookMode::Default).is_err());
+        // One that is gone leaves a venv on its defaults, as the launch check does.
+        std::fs::remove_file(&manifest).unwrap();
+        v.manifest = Some(PathBuf::from("lvpm.toml"));
+        let policy = hook_policy_for(&cli, &Destination::Venv(v), HookMode::Default).unwrap();
+        assert!(policy.manifest.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
