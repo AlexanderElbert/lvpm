@@ -2100,29 +2100,33 @@ fn cmd_install(
                 // come up only fails the relink, if one was asked for. The
                 // hooks stay pending for the next install or `run-hooks`.
                 let inst = match launch::ensure_instance(v, true, std::time::Duration::from_secs(300)) {
-                    Ok(inst) => inst,
+                    Ok(inst) => Some(inst),
+                    // Not a return: the notes and the shadowing warning
+                    // below are owed on this path too.
                     Err(e) if !want_relink => {
                         wlog!(
                             "\npost-install hooks not run: {e:#}\n      they stay pending; \
                              `lvpm run-hooks --all` runs them once LabVIEW is up"
                         );
-                        return Ok(());
+                        None
                     }
                     Err(e) => return Err(e),
                 };
-                let outcome = match want_relink {
-                    true => run_relink(&store, inst.port, relink_args, &relink_work),
-                    false => Ok(()),
-                };
-                if !hook_runs.is_empty() {
-                    run_post_install_hooks(&store, t, inst.port, relink_args, &hook_runs);
+                if let Some(inst) = inst {
+                    let outcome = match want_relink {
+                        true => run_relink(&store, inst.port, relink_args, &relink_work),
+                        false => Ok(()),
+                    };
+                    if !hook_runs.is_empty() {
+                        run_post_install_hooks(&store, t, inst.port, relink_args, &hook_runs);
+                    }
+                    if relink_args.keep_open {
+                        log!("\nleaving the venv LabVIEW open (--keep-open), VI Server on port {}", inst.port);
+                    } else {
+                        inst.shutdown_if_spawned();
+                    }
+                    outcome?;
                 }
-                if relink_args.keep_open {
-                    log!("\nleaving the venv LabVIEW open (--keep-open), VI Server on port {}", inst.port);
-                } else {
-                    inst.shutdown_if_spawned();
-                }
-                outcome?;
             }
             None => {
                 let port = viserver::ensure_vi_server(t, std::time::Duration::from_secs(120))?;
