@@ -505,7 +505,7 @@ fn install_saves_to_manifest() -> Check {
         let manifest = std::fs::read_to_string(&path).map_err(fail)?;
         ensure(manifest.contains("[dependencies.test]"), || format!("no test group:\n{manifest}"))?;
         let removed = ok(&venv(), &["uninstall", "lvpm_e2e_root", "--with-deps"])?;
-        contains(&removed, "removed lvpm_e2e_root from lvpm.toml [dependencies]")?;
+        contains(&removed, &regex::escape("removed lvpm_e2e_root from lvpm.toml [dependencies]"))?;
         let manifest = std::fs::read_to_string(&path).map_err(fail)?;
         ensure(!manifest.contains("lvpm_e2e_root"), || format!("still declared:\n{manifest}"))?;
         absent(&record("lvpm_e2e_root")?)?;
@@ -551,7 +551,7 @@ fn import_vipm_manifest() -> Check {
     let refused = lvpm(&dir, &["venv", "create", "--manifest", "vipm.toml"]).try_failure().map_err(fail)?;
     contains(&refused, "lvpm import")?;
     let imported = ok(&dir, &["--project", ".", "import", "vipm.toml"])?;
-    contains(&imported, "saved lvpm_e2e_private = \"1.0.0.1\" [dependencies]")?;
+    contains(&imported, &regex::escape("saved lvpm_e2e_private = \"1.0.0.1\" [dependencies]"))?;
     contains(&imported, "set labview = \"2026\"")?;
     ok(&dir, &["venv", "create"])?;
     ok(&dir, &["install", "--manifest", "sources.toml", "--no-relink"])?;
