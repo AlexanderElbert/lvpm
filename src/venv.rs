@@ -12,7 +12,7 @@
 //! project uses that project's venv; `--project <DIR>` names one from outside,
 //! and `--global` says the installation itself is meant.
 
-use crate::config;
+use crate::{config, launch, logging};
 use crate::project;
 use crate::target::{self, LvTarget, Roots};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -88,7 +88,7 @@ impl Venv {
     pub fn roots_for_pkg(&self, pkg: &str) -> Result<Roots> {
         ensure!(
             !pkg.is_empty() && pkg != "." && pkg != ".."
-                && pkg.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)),
+                && pkg.chars().all(|c| c.is_ascii_alphanumeric() || "._-&".contains(c)),
             "package name {pkg:?} cannot be an addon folder name"
         );
         Ok(Roots::project(&self.dir, &self.target, pkg))
@@ -125,6 +125,12 @@ impl Venv {
     /// instances on the shared `%TEMP%` would write into the same file.
     pub fn temp_dir(&self) -> PathBuf {
         self.dir.join("temp")
+    }
+
+    /// lvpm's own log of every command run on this venv: in lvpm's log
+    /// folder, not in the venv, named after the project (`logging.rs`).
+    pub fn log_path(&self) -> PathBuf {
+        logging::venv_log_path(&self.repo, &self.dir)
     }
 
     /// The process id of the LabVIEW lvpm last started on this venv.
@@ -187,6 +193,50 @@ pub fn locate(cwd: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
+/// The manifest of the project a command is in, for commands that only edit
+/// it (`lvpm import`): the manifest a venv is bound to when the repo has one,
+/// else its `lvpm.toml`. Needs no venv, and does not check that the venv's
+/// LabVIEW is installed. `--project` names the repo; otherwise the nearest
+/// project at or above `cwd`. None outside a project.
+pub fn project_manifest(project: Option<&Path>, cwd: &Path) -> Result<Option<PathBuf>> {
+    let venv_dir = config::load()?.venv_dir;
+    let repo = match project {
+        Some(dir) => Some(std::path::absolute(dir)?),
+        None => match probe_in(cwd, &venv_dir) {
+            Found::Venv(dir) | Found::ManifestOnly(dir) => Some(dir),
+            Found::Nothing => None,
+        },
+    };
+    let Some(repo) = repo else { return Ok(None) };
+    let bp = binding_path(&repo.join(&venv_dir));
+    if bp.is_file() {
+        let text = std::fs::read_to_string(&bp).with_context(|| format!("reading {}", bp.display()))?;
+        let b: Binding = serde_json::from_str(&text).with_context(|| format!("reading {}", bp.display()))?;
+        if let Some(name) = b.manifest {
+            ensure!(name.components().count() == 1, "invalid manifest filename in {}", bp.display());
+            return Ok(Some(repo.join(name)));
+        }
+    }
+    let path = repo.join(project::FILE_NAME);
+    Ok((project.is_some() || path.is_file()).then_some(path))
+}
+
+/// Bind the venv of the project at `repo` to the manifest `name` beside it,
+/// leaving the rest of the binding and everything installed as it is. For a
+/// venv created from a `vipm.toml`, which `lvpm import` moves to the
+/// `lvpm.toml` it writes.
+pub fn rebind_manifest(repo: &Path, name: &str) -> Result<()> {
+    let bp = binding_path(&repo.join(config::load()?.venv_dir));
+    rebind_manifest_at(&bp, name)
+}
+
+fn rebind_manifest_at(bp: &Path, name: &str) -> Result<()> {
+    let text = std::fs::read_to_string(bp).with_context(|| format!("reading {}", bp.display()))?;
+    let mut b: Binding = serde_json::from_str(&text).with_context(|| format!("reading {}", bp.display()))?;
+    b.manifest = Some(PathBuf::from(name));
+    std::fs::write(bp, serde_json::to_string_pretty(&b)?).with_context(|| format!("writing {}", bp.display()))
+}
+
 /// The venv a command means, if any: `--project` names the repo outright,
 /// otherwise it is looked up from `cwd`.
 pub fn find(project: Option<&Path>, cwd: &Path) -> Result<Option<Venv>> {
@@ -199,13 +249,19 @@ pub fn find_for_removal(project: Option<&Path>, cwd: &Path) -> Result<Option<Ven
 }
 
 fn find_inner(project: Option<&Path>, cwd: &Path, allow_legacy: bool) -> Result<Option<Venv>> {
-    match project {
-        Some(repo) => load_inner(repo, allow_legacy).map(Some),
+    let v = match project {
+        Some(repo) => Some(load_inner(repo, allow_legacy)?),
         None => match locate(cwd)? {
-            Some(repo) => load_inner(&repo, allow_legacy).map(Some),
-            None => Ok(None),
+            Some(repo) => Some(load_inner(&repo, allow_legacy)?),
+            None => None,
         },
+    };
+    // A command on a venv logs into the venv's file. Removal too: the file is
+    // outside the folder it deletes.
+    if let Some(v) = &v {
+        logging::attach_venv(&v.repo, &v.dir);
     }
+    Ok(v)
 }
 
 fn load_inner(repo: &Path, allow_legacy: bool) -> Result<Venv> {
@@ -317,12 +373,9 @@ pub fn create(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "project".to_string());
-        std::fs::write(
-            &manifest_path,
-            format!("[project]\nname = \"{name}\"\nlabview = \"{}\"\n\n[dependencies]\n", target.year()),
-        )
-        .with_context(|| format!("writing {}", manifest_path.display()))?;
-        eprintln!("wrote {}", manifest_path.display());
+        std::fs::write(&manifest_path, project::skeleton(&name, Some(&target.year().to_string())))
+            .with_context(|| format!("writing {}", manifest_path.display()))?;
+        elog!("wrote {}", manifest_path.display());
     }
 
     std::fs::create_dir_all(dir.join("packages")).with_context(|| format!("creating {}", dir.display()))?;
@@ -349,15 +402,16 @@ pub fn create(
     // for this LabVIEW; from now on it is the venv's, and what is set in the
     // venv IDE stays in it. Written before the binding: the binding is what
     // makes a venv exist, so a failure here leaves nothing a retry trips on.
-    crate::launch::write_ini(&v, &[])?;
+    launch::write_ini(&v, &[])?;
     std::fs::write(binding_path(&v.dir), serde_json::to_string_pretty(&b)?)?;
+    logging::attach_venv(&v.repo, &v.dir);
     Ok(v)
 }
 
 /// Delete the venv — payload, store, binding, all of it.
 pub fn remove(v: &Venv, yes: bool) -> Result<()> {
     if !yes {
-        eprint!("delete {} and everything installed in it? [y/N] ", v.dir.display());
+        elogp!("delete {} and everything installed in it? [y/N] ", v.dir.display());
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
         if !line.trim().eq_ignore_ascii_case("y") {
@@ -366,12 +420,12 @@ pub fn remove(v: &Venv, yes: bool) -> Result<()> {
     }
     std::fs::remove_dir_all(&v.dir).with_context(|| {
         let mut why = format!("removing {}", v.dir.display());
-        if crate::launch::is_listening(v.port) {
+        if launch::is_listening(v.port) {
             why.push_str(" — a LabVIEW is running on this venv and holds files open; close it first");
         }
         why
     })?;
-    println!("removed {}", v.dir.display());
+    log!("removed {}", v.dir.display());
     Ok(())
 }
 
@@ -379,15 +433,20 @@ pub fn remove(v: &Venv, yes: bool) -> Result<()> {
 /// instance and a later `lvpm install` agree on where to meet: a hash of the
 /// venv's path into 3400–3999, clear of the 33xx LabVIEW's own defaults use.
 pub fn port_for(dir: &Path) -> u16 {
+    3400 + (path_hash(dir) % 600) as u16
+}
+
+/// A venv folder's path as a number: FNV-1a, 64-bit, over the path lowercased
+/// with `/` separators — small, dependency-free, and good enough to spread a
+/// handful of repo paths across ports and log names.
+pub fn path_hash(dir: &Path) -> u64 {
     let key = dir.to_string_lossy().to_lowercase().replace('\\', "/");
-    // FNV-1a, 64-bit — small, dependency-free, and good enough to spread a
-    // handful of repo paths across six hundred ports.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in key.bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    3400 + (h % 600) as u16
+    h
 }
 
 #[cfg(test)]
@@ -471,6 +530,20 @@ mod tests {
     }
 
     #[test]
+    fn rebinding_changes_the_manifest_and_nothing_else() {
+        let repo = scratch_dir("rebind");
+        let bp = binding_path(&repo);
+        let old = r#"{"target_key":"k","target_path":"p","version":26.3,"bitness":64,"port":3500,"created_at":7,"manifest":"vipm.toml"}"#;
+        std::fs::write(&bp, old).unwrap();
+        rebind_manifest_at(&bp, project::FILE_NAME).unwrap();
+        let b: Binding = serde_json::from_str(&std::fs::read_to_string(&bp).unwrap()).unwrap();
+        assert_eq!(b.manifest, Some(PathBuf::from("lvpm.toml")));
+        assert_eq!((b.target_key.as_str(), b.target_path.as_str(), b.bitness, b.port, b.created_at), ("k", "p", 64, 3500, 7));
+        assert!(rebind_manifest_at(&repo.join("absent.json"), "lvpm.toml").is_err());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn environment_paths_and_package_names_are_scoped_to_the_new_layout() {
         let dir = scratch_dir("paths");
         let target = LvTarget { version: 26.3, bitness: 64, path: dir.join("LabVIEW") };
@@ -481,12 +554,15 @@ mod tests {
         assert_eq!(v.data_dir(), dir.join("data"));
         assert_eq!(v.temp_dir(), dir.join("temp"));
         assert_eq!(v.pid_path(), dir.join("labview.pid"));
-        assert!(v.roots_for_pkg(".").is_err());
-        assert!(v.roots_for_pkg("..").is_err());
-        assert_eq!(v.roots_for_pkg("pkg").unwrap().application, dir.join("packages").join("pkg").join("1"));
+        for pkg in ["", ".", "..", "../pkg", r"..\pkg", "/pkg", r"C:\pkg"] {
+            assert!(v.roots_for_pkg(pkg).is_err(), "{pkg:?}");
+        }
+        for pkg in ["pkg", "pkg&extra"] {
+            assert_eq!(v.roots_for_pkg(pkg).unwrap().application, dir.join("packages").join(pkg).join("1"));
+        }
 
         std::fs::write(v.ini_path(), "[LabVIEW]\ncustom=True\n").unwrap();
-        crate::launch::write_ini(&v, &[]).unwrap();
+        launch::write_ini(&v, &[]).unwrap();
         let ini = std::fs::read_to_string(v.ini_path()).unwrap();
         let location = v.packages_dir().to_string_lossy().into_owned();
         let location = if location.contains(' ') { format!("\"{location}\"") } else { location };

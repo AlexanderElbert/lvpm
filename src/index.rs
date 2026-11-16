@@ -164,7 +164,7 @@ fn scan_local_repo(cache: &Cache, dir: &Path, refresh: bool, out: &mut Vec<Entry
             }
             Err(error) => {
                 cache.forget_local(&path)?;
-                eprintln!("  ! ignoring {}: {error:#}", path.display());
+                ewlog!("  ! ignoring {}: {error:#}", path.display());
             }
         }
     }
@@ -179,7 +179,7 @@ fn entry_from_vip(path: &Path) -> Result<Entry> {
 fn entry_from_bytes(path: &Path, bytes: &[u8]) -> Result<Entry> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
     let idx = (0..zip.len())
-        .find(|i| zip.by_index(*i).map(|f| f.name().eq_ignore_ascii_case("spec")).unwrap_or(false))
+        .find(|i| zip.by_index(*i).is_ok_and(|f| f.name().is_ok_and(|n| n.eq_ignore_ascii_case("spec"))))
         .context("no `spec` member")?;
     let mut buf = Vec::new();
     std::io::Read::read_to_end(&mut zip.by_index(idx)?, &mut buf)?;
@@ -241,6 +241,27 @@ pub fn cache_add(cache_dir: &Path, source: &Path, refresh: bool) -> Result<Vec<I
         imports.push(Import { path, sha256, reused: false });
     }
     Ok(imports)
+}
+
+/// Import package bytes carried inside another file (a `.vipc`'s `Included`
+/// packages) into the cache, as `cache add` does for a file of its own, so
+/// the resolver finds them like any imported package. Returns the package's
+/// name, version and SHA-256, and whether those bytes were stored already.
+/// The name and version a package archive gives itself in its `spec`,
+/// without caching it: what an install of those bytes would record.
+pub fn package_identity(bytes: &[u8]) -> Result<(String, String)> {
+    let entry = entry_from_bytes(Path::new(""), bytes)?;
+    Ok((entry.name, entry.version.raw))
+}
+
+pub fn cache_add_bytes(cache_dir: &Path, source_ref: &str, bytes: &[u8]) -> Result<(String, String, String, bool)> {
+    let entry = entry_from_bytes(Path::new(source_ref), bytes).with_context(|| format!("importing {source_ref}"))?;
+    let cache = Cache::open(cache_dir)?;
+    let sha = crate::cache::sha256_hex(bytes);
+    let had = cache.load(&sha)?.is_some();
+    let sha256 = cache.store(bytes)?;
+    cache.record_embedded(source_ref, &LocalEntry::from(&entry), &sha256, &md5_hex(bytes))?;
+    Ok((entry.name, entry.version.to_string(), sha256, had))
 }
 
 /// Load public indexes, global local package folders, and hosted manifest sources.
@@ -326,8 +347,8 @@ fn feed_body(
     // reach the terminal before the wait, not after it.
     let started = std::time::Instant::now();
     match cached.is_some() {
-        true => eprint!("  checking feed {url} ... "),
-        false => eprint!("  downloading feed {url} (first run) ... "),
+        true => elogp!("  checking feed {url} ... "),
+        false => elogp!("  downloading feed {url} (first run) ... "),
     }
     std::io::Write::flush(&mut std::io::stderr()).ok();
     let mut resp = req.send().with_context(|| format!("fetching {url}"))?;
@@ -335,7 +356,7 @@ fn feed_body(
     if resp.status() == StatusCode::NOT_MODIFIED {
         match cached {
             Some(bytes) => {
-                eprintln!("unchanged ({:.1}s)", started.elapsed().as_secs_f32());
+                elog!("unchanged ({:.1}s)", started.elapsed().as_secs_f32());
                 return Ok(String::from_utf8_lossy(&bytes).into_owned());
             }
             // A 304 carries no body, so one we have nothing cached for (a
@@ -360,7 +381,7 @@ fn feed_body(
         sha256: None,
     };
     let bytes = resp.bytes()?;
-    eprintln!(
+    elog!(
         "{:.1} MB in {:.1}s",
         bytes.len() as f32 / 1_048_576.0,
         started.elapsed().as_secs_f32()
