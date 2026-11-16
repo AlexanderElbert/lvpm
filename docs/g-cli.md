@@ -68,9 +68,39 @@ install path comes from the registry.
 - With no LabVIEW running, G-CLI starts a global LabVIEW: no venv packages,
   the user's cache and `LabVIEW Data`, and a save relinks against global
   packages.
-- With a venv LabVIEW open, the new `LabVIEW.exe` reads the global ini and
-  is usually forwarded to a running instance — the primary IDE, as noted
-  where `AllowMultipleInstances` is set in `src/launch.rs`.
+- With LabVIEW already running, the new `LabVIEW.exe` hands the VI to the
+  most recently started instance and exits. That can be the venv IDE or the
+  primary IDE, depending only on which was opened last (see
+  [Handing a VI to a running LabVIEW](#handing-a-vi-to-a-running-labview-measured)).
+
+### Handing a VI to a running LabVIEW (measured)
+
+Measured on LabVIEW 2026 64-bit (v26.3), Windows 11, 2026-11-16. A primary
+IDE (global ini) and a venv IDE (`lvpm launch`) were both open, and three
+copies of a harmless `vi.lib` VI were opened with `LabVIEW.exe`, each copy
+named for its case. The process whose window showed the copy's name had
+received it. Every process a case started was closed before the next case.
+
+| Case | Command | Primary started first | Venv started first |
+|---|---|---|---|
+| A | `LabVIEW.exe <vi> -unattended` (what G-CLI runs) | venv IDE | primary IDE |
+| B | `LabVIEW.exe -pref <venv ini> <vi> -unattended` | new process | new process |
+| C | as B, with `AllowMultipleInstances=False` in a copy of the venv ini | venv IDE | primary IDE |
+
+- **The handoff goes to the most recently started instance, whatever the
+  ini.** In A and C the new process exited within about a second and the VI
+  opened in the IDE started last. `-pref` does not choose the target.
+- **`AllowMultipleInstances=True` always starts a new process** (B), which
+  is why lvpm sets it and why `launch::is_running` must stop a second launch
+  on the same venv.
+- **There is no way to direct `LabVIEW.exe` at a particular instance.**
+  Reaching a specific running LabVIEW takes its VI Server port, which is
+  per instance (`port_for`).
+- Not separated yet: "most recently started" and "most recently focused".
+  The IDE started last was also the last to get focus.
+
+So today's `g-cli` already runs in a venv IDE by accident when that IDE was
+opened after the primary one, and in the primary IDE otherwise.
 
 Installing G-CLI into a venv is worse still: lvpm runs post-install hooks, so
 the package's MSI would install a machine-wide `g-cli` from a venv install.
@@ -130,7 +160,7 @@ Outside a venv, or with `--global`, behaviour is upstream's. Inside one:
 | | Upstream G-CLI | lvpm |
 |---|---|---|
 | Launch | `LabVIEW.exe <vi> -unattended -- -p:N` | adds `-pref .lv-venv/labview.ini` and the venv `TEMP` |
-| LabVIEW already running | launches again; the VI is forwarded to a running instance, often the primary IDE | runs the VI in the venv instance over VI Server. A second `-pref` launch would start a second instance on the same cache (`AllowMultipleInstances=True`), the SQLITE_BUSY case `is_running` guards against. "Run when opened" does not fire on Open VI Reference, so the VI is run explicitly. |
+| LabVIEW already running | launches again; the VI is handed to the most recently started instance, venv or primary (measured above) | runs the VI in the venv instance over VI Server. A second `-pref` launch would start a second instance on the same cache (`AllowMultipleInstances=True`), the SQLITE_BUSY case `is_running` guards against. "Run when opened" does not fire on Open VI Reference, so the VI is run explicitly. |
 | `--lv-ver` / `--arch` not the venv's | falls back to the default install | refused: the global install would silently bypass the venv |
 | `--kill`, Ctrl-C | kills the LabVIEW process | kills only an instance this run started (`Instance::shutdown_if_spawned`); in a reused instance — possibly the user's `lvpm launch` IDE — the VI is aborted instead |
 | Tool lookup | `<install>/vi.lib/G CLI Tools` | each venv package's `1/vi.lib/G CLI Tools` first, then the installation |
@@ -183,9 +213,11 @@ instead of vendoring its proxy: write the venv ini, set `G_CLI_LV_INI`,
 side either way:
 
 - reusing a venv LabVIEW that is already running. A second `-pref` launch
-  starts a second instance on the same cache (`AllowMultipleInstances=True`).
-  The wrapper has to detect this (`launch::is_running`) and either refuse or
-  run the VI over VI Server;
+  starts a second instance on the same cache (`AllowMultipleInstances=True`),
+  and a launch without it is handed to whichever instance started last, not
+  necessarily the venv's (measured above). The wrapper has to detect this
+  (`launch::is_running`) and either refuse or run the VI over VI Server.
+  G-CLI's own startup cannot do it;
 - refusing an `--lv-ver`/`--arch` that is not the venv's, which upstream
   quietly falls back from;
 - `--kill` only for an instance this run started;
@@ -214,6 +246,9 @@ upstream's answer. Vendoring stays the fallback.
   a venv package, check on a real install that the path LabVIEW reports is
   the on-disk `.lv-venv/packages/…` path the proxy registered, not a
   `vi.lib`-overlay path.
+- **Start order or focus.** The handoff measurement does not yet separate
+  the most recently started instance from the most recently focused one.
+  Repeat it with the first IDE brought to the front before the launch.
 - **Running a reused instance.** Confirm that a G-CLI VI started with
   `run_vi_async` (front panel not opened) behaves as when opened from the
   command line, including how it closes itself after `EXIT`.
