@@ -56,6 +56,39 @@ installs the LabVIEW library to `<vi.lib>\G CLI Tools`, and its post-install
 VI runs a bundled MSI that installs `g-cli.exe` machine-wide and appends it
 to the **system** PATH.
 
+### Why G-CLI starts `LabVIEW.exe` itself
+
+G-CLI started in August 2015, three years before NI shipped its LabVIEW CLI
+with LabVIEW 2018. It was called "LabVIEW CLI" until 2.0 renamed it to avoid
+the clash (`docs/book/src/migrating_name_change.md`). Starting
+`LabVIEW.exe <vi>` and letting the VI connect back follows from what it is
+for:
+
+- **No LabVIEW setup.** VI Server over TCP is off in a fresh LabVIEW. A VI
+  set to run when opened needs nothing enabled. The README lists "no need to
+  provide long paths or port numbers" as a benefit over NI's tool.
+- **Built executables work the same way.** A built app usually has no VI
+  Server, but it can be started with `-- -p:<port>` and connect back. A VI
+  in the IDE and a built `.exe` share one path.
+- **The VI is the program.** G-CLI is a framework for command-line tools
+  written in LabVIEW: argument parser, `Start CLI Interface`, output streamed
+  while the tool runs, exit codes. The VI opens the connection and drives
+  it, instead of being called through a fixed connector pane.
+- **No dependency on VI Server's protocol,** which is undocumented and tied
+  to LabVIEW versions. G-CLI's frame format has barely changed since 2015,
+  which kept the Rust rewrite and the Linux port simple.
+
+The cost is that `LabVIEW.exe <vi>` cannot choose a running instance (see
+[Handing a VI to a running LabVIEW](#handing-a-vi-to-a-running-labview-measured)).
+G-CLI is built around that handoff. The port goes through the Service
+Locator, keyed by VI path, because a handed-off VI never sees the new
+process's `-p:<port>`. The process monitor follows a "lost" PID to another
+process with the same exe path, because the PID it started exits after
+handing off. On a CI agent with one LabVIEW this costs nothing.
+
+G-CLI 1.x had `--lv-exe` to name the LabVIEW executable. 2.0 deprecated it
+in favour of `--lv-ver` / `--arch` detection (`getting_started.md`).
+
 ## Why it cannot run on a venv
 
 A venv is activated by starting LabVIEW with `-pref .lv-venv/labview.ini` and
@@ -101,6 +134,48 @@ received it. Every process a case started was closed before the next case.
 
 So today's `g-cli` already runs in a venv IDE by accident when that IDE was
 opened after the primary one, and in the primary IDE otherwise.
+
+### NI's LabVIEW CLI, for comparison (observed)
+
+Observed on the same machine with LabVIEW 2026 and the LabVIEW CLI in
+`C:\Program Files (x86)\National Instruments\Shared\LabVIEW CLI`.
+`LabVIEWCLI -OperationName RunVI -Help`, run with no LabVIEW open:
+
+1. With no `-LabVIEWPath`, used "the last used LabVIEW" (2026).
+2. Started it as `LabVIEW.exe -labviewcli`. That was the whole command
+   line: no VI, no `-pref`, no `-unattended`.
+3. Connected on port 3363, which is the global `LabVIEW.ini`'s
+   `server.tcp.port`. The new LabVIEW was the process listening on it.
+4. Ran the operation inside LabVIEW and printed its output.
+   `-OperationName CloseLabVIEW -PortNumber 3363` closed it again.
+
+`LabVIEWCLI.exe` is a native 32-bit client (`nilvcli.dll`). The operations
+are LabVIEW classes under `Operations\` (`RunVI\RunVI.lvclass`,
+`MassCompile`, `ExecuteBuildSpec`, …) that run inside the target LabVIEW, and
+`-AdditionalOperationDirectory` adds more. RunVI takes
+`-VIPath <vi> <arguments>` and passes the arguments to the VI as a string
+array. The VI needs a fixed connector pane, which was not checked here.
+
+| | G-CLI | LabVIEW CLI |
+|---|---|---|
+| Starts LabVIEW with | `LabVIEW.exe <vi> -unattended -- -p:<port>` | `LabVIEW.exe -labviewcli` |
+| Reaches the VI | the VI opens itself and connects back over TCP | the client connects to LabVIEW's VI Server port and runs the VI |
+| LabVIEW already running | handed to the instance started last | chosen by `-PortNumber` |
+| Choosing LabVIEW | `--lv-ver`, `--arch` (registry) | `-LabVIEWPath` |
+| Custom ini / `-pref` | no | no |
+| Output | streamed while the VI runs | operation output and log at the end |
+| Requires | the G-CLI library in the VI | VI Server enabled; RunVI's connector pane |
+
+For venvs, the LabVIEW CLI has the opposite gap to G-CLI:
+
+- **A running venv LabVIEW can be named by its port.** It listens on its
+  own VI Server port (`port_for`), so
+  `LabVIEWCLI -OperationName RunVI -PortNumber <venv port> -VIPath …` may run
+  directly in it. Untested: whether a venv LabVIEW started without
+  `-labviewcli` accepts the operation (see Open questions).
+- **A cold start gets the global LabVIEW.** With no `-pref`, a LabVIEW the
+  CLI starts itself reads the global ini and port. The venv LabVIEW has to
+  be started first (`lvpm launch`).
 
 Installing G-CLI into a venv is worse still: lvpm runs post-install hooks, so
 the package's MSI would install a machine-wide `g-cli` from a venv install.
@@ -203,7 +278,9 @@ That is the only thing lvpm cannot pass to G-CLI today:
 - Install detection and the Service Locator key are unchanged. A venv runs
   the installation's own `LabVIEW.exe` (`LvTarget::exe`), so the version and
   bitness that G-CLI registers are still the ones the LabVIEW library looks
-  up. An option that replaced the exe path would have broken this.
+  up. An option that replaced the exe path would have broken this. It
+  would also have revived the `--lv-exe` that G-CLI deprecated in 2.0 in
+  favour of detection, which `--lv-ini` keeps.
 - The option has uses outside lvpm, such as a build agent's own VI Server
   port or object cache. That makes it a reasonable upstream request.
 
@@ -246,6 +323,10 @@ upstream's answer. Vendoring stays the fallback.
   a venv package, check on a real install that the path LabVIEW reports is
   the on-disk `.lv-venv/packages/…` path the proxy registered, not a
   `vi.lib`-overlay path.
+- **LabVIEW CLI against a venv LabVIEW.** Run
+  `LabVIEWCLI -OperationName RunVI -PortNumber <venv port>` against an
+  `lvpm launch` instance. The `supportVIs\_LabVIEWCLI_StartService.vi` name
+  suggests the CLI may need a service that only `-labviewcli` starts.
 - **Start order or focus.** The handoff measurement does not yet separate
   the most recently started instance from the most recently focused one.
   Repeat it with the first IDE brought to the front before the launch.
@@ -267,6 +348,11 @@ upstream's answer. Vendoring stays the fallback.
 - **Point G-CLI at a launcher `.exe`.** G-CLI launches an exe with only
   `-- -p:<port>`: no VI path and no Service Locator registration, and its
   process monitoring and `--kill` would act on the launcher, not LabVIEW.
+- **Use NI's LabVIEW CLI instead.** It can target a running venv LabVIEW
+  by port, but existing `g-cli` tools and scripts would not run unchanged:
+  their VIs talk to the G-CLI library, not to RunVI's connector pane, and
+  output only arrives at the end. A possible complement for
+  `MassCompile` / `ExecuteBuildSpec` on a venv, not a replacement.
 - **Upstream launch hook.** An option such as `G_CLI_LAUNCHER=<cmd>` that
   G-CLI calls instead of starting LabVIEW. G-CLI's process monitoring and
   `--kill` would then track the launcher, not LabVIEW, and the hook would
