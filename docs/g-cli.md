@@ -154,6 +154,47 @@ that depends on it, and many CLI tools do. Instead:
 - The package's post-install MSI never runs, because the package is never
   installed from its `.vip`.
 
+## Upstream: `--lv-ini`
+
+A smaller change in G-CLI itself covers the most common case, a cold start in
+CI. Branch [`feature/lv-ini`](https://github.com/labview-package-manager/G-CLI/tree/feature/lv-ini)
+on our fork adds `--lv-ini <path>`, also read from `G_CLI_LV_INI`, which puts
+`-pref <path>` in front of the VI on G-CLI's LabVIEW command line:
+
+```
+LabVIEW.exe -pref <ini> <vi> -unattended -- -p:<port>
+```
+
+That is the only thing lvpm cannot pass to G-CLI today:
+
+- The rest of a venv launch already gets through. G-CLI starts LabVIEW with
+  `CreateProcessW` and a null environment, so `TEMP`/`TMP` set by the caller
+  reach LabVIEW.
+- Install detection and the Service Locator key are unchanged. A venv runs
+  the installation's own `LabVIEW.exe` (`LvTarget::exe`), so the version and
+  bitness that G-CLI registers are still the ones the LabVIEW library looks
+  up. An option that replaced the exe path would have broken this.
+- The option has uses outside lvpm, such as a build agent's own VI Server
+  port or object cache. That makes it a reasonable upstream request.
+
+If upstream merges it, lvpm's `g-cli` / `lvpm run` can wrap the real G-CLI
+instead of vendoring its proxy: write the venv ini, set `G_CLI_LV_INI`,
+`TEMP` and `TMP` on the child, and exec `g-cli`. These parts stay on lvpm's
+side either way:
+
+- reusing a venv LabVIEW that is already running. A second `-pref` launch
+  starts a second instance on the same cache (`AllowMultipleInstances=True`).
+  The wrapper has to detect this (`launch::is_running`) and either refuse or
+  run the VI over VI Server;
+- refusing an `--lv-ver`/`--arch` that is not the venv's, which upstream
+  quietly falls back from;
+- `--kill` only for an instance this run started;
+- installing the LabVIEW library and never running the package's MSI.
+
+Wrapping also means a separate G-CLI install to depend on, and its version is
+not pinned by lvpm. Choosing between wrapping and vendoring can wait for
+upstream's answer. Vendoring stays the fallback.
+
 ## Costs
 
 - **G-CLI's version follows lvpm's.** A G-CLI release needs an lvpm release
@@ -192,7 +233,7 @@ that depends on it, and many CLI tools do. Instead:
   `-- -p:<port>`: no VI path and no Service Locator registration, and its
   process monitoring and `--kill` would act on the launcher, not LabVIEW.
 - **Upstream launch hook.** An option such as `G_CLI_LAUNCHER=<cmd>` that
-  G-CLI calls instead of starting LabVIEW would let the real G-CLI run on a
-  venv. Worth proposing upstream, but it does not remove the need for lvpm
-  to install the LabVIEW library and to stop the MSI hook, and it leaves a
-  second install to manage.
+  G-CLI calls instead of starting LabVIEW. G-CLI's process monitoring and
+  `--kill` would then track the launcher, not LabVIEW, and the hook would
+  need its own contract. Superseded by the smaller `--lv-ini` change in
+  [Upstream: `--lv-ini`](#upstream---lv-ini).
