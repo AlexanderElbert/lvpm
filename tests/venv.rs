@@ -109,6 +109,24 @@ impl Lab {
         self.package_with(name, version, requires, "", &[]);
     }
 
+    fn package_with_menus(&self, name: &str, menus: &[(&str, &[u8])]) {
+        let mut extra = format!(
+            "[File Group 1]\nTarget Dir=\"<menus>\"\nReplace Mode=\"Always\"\nNum Files={}\n",
+            menus.len()
+        );
+        let mut paths = Vec::new();
+        for (index, (path, _)) in menus.iter().enumerate() {
+            extra.push_str(&format!("File {index}=\"{path}\"\n"));
+            paths.push(format!("File Group 1/{path}"));
+        }
+        let members: Vec<(&str, &[u8])> = paths
+            .iter()
+            .zip(menus)
+            .map(|(path, (_, bytes))| (path.as_str(), *bytes))
+            .collect();
+        self.package_with(name, "1.0.0.1", "", &extra, &members);
+    }
+
     fn run_in(&self, dir: &Path, args: &[&str]) -> Run {
         let out = Command::new(env!("CARGO_BIN_EXE_lvpm"))
             .current_dir(dir)
@@ -265,6 +283,84 @@ fn manifest_install_brings_in_main_and_the_selected_groups_only() {
     // An empty selection is an error, not a silent no-op.
     lab.write_manifest("[dependencies]\n");
     has(&lab.fails(&["install"]), "nothing to install: the selected groups (main) are empty");
+}
+
+#[test]
+fn venv_installs_merge_palette_trees_and_rebuild_them_after_uninstall() {
+    let lab = Lab::new("palettes");
+    let labview_menu = lab
+        .root
+        .join("labview/menus/Categories/Computer/LabVIEW.mnu");
+    std::fs::create_dir_all(labview_menu.parent().unwrap()).unwrap();
+    std::fs::write(&labview_menu, b"LabVIEW category").unwrap();
+    lab.package_with_menus(
+        "alpha",
+        &[
+            ("Categories/Programming/Shared/dir.mnu", b"alpha"),
+            ("Categories/Programming/Shared/shared.mnu", b"shared"),
+            ("Root.mnu", b"root"),
+            ("Controls/alpha.mnu", b"control"),
+        ],
+    );
+    lab.package_with_menus(
+        "beta",
+        &[
+            ("Categories/Programming/Shared/dir.mnu", b"beta"),
+            ("Categories/Programming/Shared/shared.mnu", b"shared"),
+            ("Categories/Programming/Shared/beta.mnu", b"beta"),
+            ("Categories/Computer/beta.mnu", b"computer"),
+        ],
+    );
+    lab.write_manifest("[dependencies]\nalpha = \"*\"\nbeta = \"*\"\n");
+    lab.ok(&["venv", "create"]);
+    lab.ok(&["install", "--no-linkfix"]);
+
+    let packages = lab.venv().join("packages");
+    let menus = packages.join("venv-palettes/1/menus");
+    assert_eq!(
+        std::fs::read(menus.join("Categories/Programming/Shared/dir.mnu")).unwrap(),
+        b"alpha"
+    );
+    assert_eq!(
+        std::fs::read(menus.join("Categories/Programming/Shared/shared.mnu")).unwrap(),
+        b"shared"
+    );
+    assert_eq!(std::fs::read(menus.join("Root.mnu")).unwrap(), b"root");
+    assert_eq!(std::fs::read(menus.join("Controls/alpha.mnu")).unwrap(), b"control");
+    assert_eq!(std::fs::read(menus.join("Categories/Computer/beta.mnu")).unwrap(), b"computer");
+    assert_eq!(std::fs::read(&labview_menu).unwrap(), b"LabVIEW category");
+    assert!(lab.file("alpha", "alpha.txt").is_file());
+    assert!(lab.file("beta", "beta.txt").is_file());
+    for package in ["alpha", "beta"] {
+        assert!(!packages.join(package).join("1/menus").exists());
+        assert!(lab.venv().join("palettes/contributions").join(package).join("menus").is_dir());
+    }
+    let shared = menus.join("Categories/Programming/Shared/shared.mnu");
+    std::fs::write(&shared, b"tampered").unwrap();
+    let refused = lab.fails(&["launch"]);
+    has(&refused, "palettes:");
+    has(&refused, "run `lvpm install`");
+    lab.ok(&["install", "--no-linkfix"]);
+    assert_eq!(std::fs::read(&shared).unwrap(), b"shared");
+    let unexpected = packages.join("venv-palettes/1/unexpected.txt");
+    std::fs::write(&unexpected, b"unexpected").unwrap();
+    has(&lab.fails(&["launch"]), "palettes:");
+    lab.ok(&["install", "--no-linkfix"]);
+    assert!(!unexpected.exists());
+
+    lab.ok(&["uninstall", "alpha"]);
+    assert!(!menus.join("Root.mnu").exists());
+    assert_eq!(
+        std::fs::read(menus.join("Categories/Programming/Shared/dir.mnu")).unwrap(),
+        b"beta"
+    );
+    assert_eq!(
+        std::fs::read(menus.join("Categories/Programming/Shared/shared.mnu")).unwrap(),
+        b"shared"
+    );
+
+    lab.ok(&["uninstall", "--all"]);
+    assert!(!packages.join("venv-palettes/1").exists());
 }
 
 #[test]

@@ -57,15 +57,19 @@ there (icon templates, right-click plugins) are not available in it.
 Before starting, `launch` checks the venv's install records against the
 manifest's `[dependencies]` (`main` only): every package installed at a
 version the manifest allows, all of its recorded files present, the relink
-pass done where `relink = true`, and PostInstall run where the hook policy
-runs it. It refuses on a mismatch and names each one; `--no-check` starts
-anyway. Files edited or resaved since install are not detected.
+pass done where `relink = true`, PostInstall run where the hook policy
+runs it, and the merged palette addon matches its package contributions. It
+refuses on a mismatch and names each one; `--no-check` starts anyway. Files
+edited or resaved since install are not detected.
 
 ## Layout
 
 ```text
 .lv-venv/
   packages/<pkg>/1/    package addon and its mirrored LabVIEW tree
+  packages/venv-palettes/1/ merged `menus/` tree
+  palettes/
+    contributions/<pkg>/menus/  original package menu trees, outside the mount
   installed/           package installation records
   venv.json            LabVIEW binding
   labview.ini          venv-specific LabVIEW settings
@@ -117,12 +121,27 @@ flowchart TD
     q2 -- no --> a3["Missing: LabVIEW cannot find it."]
 ```
 
+Package `menus/` trees are stored outside the mounted addon location and
+reconciled into `packages/venv-palettes/1/menus/`. This gives shared category
+paths one addon provider while keeping each package's contribution available
+for upgrades, verification and uninstall. Byte-identical files are
+deduplicated. When contributors provide different `dir.mnu` files at the same
+path, the first package in case-insensitive package-name order supplies that
+file; different non-`dir.mnu` files at one path fail reconciliation and leave
+the previously published tree untouched. `lvpm install` migrates existing
+package-local menu files automatically. It does not change package archives
+or the global LabVIEW installation. lvpm preserves the menu tree's relative
+paths but does not parse opaque `.mnu` contents: absolute references, paths
+that escape `menus/`, and other internal resource references are not validated
+and may not survive relocation. The launch check verifies the merged files and
+addon metadata, not palette visibility inside the LabVIEW IDE.
+
 So a package that is also in the installation, from VIPM or an earlier
 global install, loads from there whatever version the venv holds. See
 below for the warning lvpm gives.
 
-Environments created with the old layout must be recreated: close their
-LabVIEW instance, then run `lvpm venv remove`, `lvpm venv create`, and
+Environments created with the legacy package layout must be recreated: close
+their LabVIEW instance, then run `lvpm venv remove`, `lvpm venv create`, and
 `lvpm install`. Removing the venv also removes its installed packages and
 venv-specific settings.
 

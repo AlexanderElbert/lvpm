@@ -5,6 +5,12 @@ After the files are copied, an install prepares them for their new location
 and rebuilds palettes and menus. Only the relink and hooks need a running
 LabVIEW; lvpm talks to it over VI Server.
 
+In a project venv, package `menus/` files are instead retained under the venv's
+private palette contribution store and merged into the reserved
+`venv-palettes` addon after install, upgrade, migration, or uninstall. The
+published addon is staged and checked before it replaces the previous tree.
+See [venvs.md](venvs.md#how-it-works) for ownership and conflict handling.
+
 ## Linkfix: normal package preparation
 
 **Linkfix runs by default after copying, before PostInstall hooks.** It makes
