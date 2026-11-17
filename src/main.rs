@@ -42,6 +42,7 @@ mod venv;
 mod version;
 mod vipm_interop;
 mod viserver;
+mod watcher;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
@@ -344,6 +345,20 @@ enum Cmd {
         #[arg(long)]
         no_check: bool,
     },
+    /// Keep a tag in the window titles of one LabVIEW until it exits.
+    /// Started hidden by `launch`; see the `venv.title` setting.
+    #[command(hide = true)]
+    TitleWatch {
+        /// Process id of the LabVIEW to watch.
+        #[arg(long)]
+        pid: u32,
+        /// The text to put in each title, e.g. `[my-project]`.
+        #[arg(long)]
+        tag: String,
+        /// `end` or `start`.
+        #[arg(long, default_value = "end")]
+        position: String,
+    },
     /// Rewrite installed VI links and set libraries/classes source-only the
     /// way LabVIEW saves them. Defaults to the venv in effect; `--tree` takes
     /// any LabVIEW-shaped folder or venv store.
@@ -531,6 +546,16 @@ fn run(cli: &Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Launch { lvproj, ini_keys, no_check } => cmd_launch(&cli, lvproj.as_deref(), ini_keys, *no_check),
+        Cmd::TitleWatch { pid, tag, position } => {
+            let pos: config::TitlePosition = position.parse()?;
+            #[cfg(windows)]
+            return watcher::watch(*pid, tag, pos);
+            #[cfg(not(windows))]
+            {
+                let _ = (pid, tag, pos);
+                bail!("title-watch is Windows-only");
+            }
+        }
         Cmd::Linkfix { tree, dry_run, verbose, keep_compiled_code, fix, report, bitness } => {
             let mut methods: Vec<linkfix::Method> = if fix.is_empty() { linkfix::Method::ALL.to_vec() } else { fix.clone() };
             if *keep_compiled_code {
@@ -2878,7 +2903,8 @@ fn cmd_launch(cli: &Cli, lvproj: Option<&Path>, ini_keys: &[String], no_check: b
         None => None,
     };
     let ini = launch::write_ini(&v, &extra)?;
-    launch::spawn(&v, &ini, lvproj.as_deref())?;
+    let child = launch::spawn(&v, &ini, lvproj.as_deref())?;
+    let titles = start_title_watcher(&v, child.id());
     log!("started {} on {}", v.target.label(), v.dir.display());
     log!("  ini            {}", ini.display());
     for (k, val) in &extra {
@@ -2888,7 +2914,49 @@ fn cmd_launch(cli: &Cli, lvproj: Option<&Path>, ini_keys: &[String], no_check: b
     if let Some(p) = &lvproj {
         log!("  opening        {}", p.display());
     }
+    if let Some(t) = titles {
+        log!("  window titles  {t}");
+    }
     Ok(())
+}
+
+/// Start the hidden watcher that keeps the venv's name in the window titles
+/// of the LabVIEW with process id `pid` (see `watcher`). Returns what to tell
+/// the user, or `None` when the setting is `off` or there is no watcher on
+/// this platform. Never fails the launch: a watcher that could not start is a
+/// warning.
+fn start_title_watcher(v: &venv::Venv, pid: u32) -> Option<String> {
+    let pos = match config::load() {
+        Ok(cfg) => cfg.venv_title,
+        Err(e) => {
+            wlog!("warning: window titles left as they are: {e:#}");
+            return None;
+        }
+    };
+    if pos == config::TitlePosition::Off || !cfg!(windows) {
+        return None;
+    }
+    let name = v.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "venv".into());
+    let tag = format!("[{name}]");
+    let started = std::env::current_exe().and_then(|exe| {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(["title-watch", "--pid", &pid.to_string(), "--tag", &tag, "--position", pos.as_str()]);
+        #[cfg(windows)]
+        {
+            // lvpm is a console program: without this, its watcher would
+            // open a console window of its own for LabVIEW's lifetime.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::os::windows::process::CommandExt::creation_flags(&mut cmd, CREATE_NO_WINDOW);
+        }
+        launch::spawn_detached(&mut cmd)
+    });
+    match started {
+        Ok(_) => Some(format!("{tag} at the {} (venv.title)", pos.as_str())),
+        Err(e) => {
+            wlog!("warning: could not start the window title watcher: {e}");
+            None
+        }
+    }
 }
 
 /// Invoke Application methods by id and print each answer.

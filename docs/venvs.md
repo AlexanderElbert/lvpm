@@ -61,6 +61,31 @@ pass done where `relink = true`, and PostInstall run where the hook policy
 runs it. It refuses on a mismatch and names each one; `--no-check` starts
 anyway. Files edited or resaved since install are not detected.
 
+### The venv's name in window titles
+
+On Windows, `launch` also starts a small hidden `lvpm` beside the venv
+LabVIEW that keeps the project folder's name in its window titles, so a venv
+IDE and your primary one (or two venvs) can be told apart in the taskbar and
+in Alt+Tab:
+
+```text
+MyProject.lvproj - Project Explorer [MyProject]
+Main.vi Front Panel on MyProject.lvproj/My Computer [MyProject] *
+```
+
+It tags the Getting Started window, Project Explorer, front panels, block
+diagrams and class or library windows; dialogs and palettes keep their
+titles. LabVIEW rewrites a title on every edit and save, and the watcher puts
+the tag back straight after, so it can be missing for a moment. LabVIEW's
+`*` for unsaved changes stays where LabVIEW shows it. The watcher reacts to
+window events only, uses no CPU in between, and exits with its LabVIEW; each
+launched venv LabVIEW has its own.
+
+The `venv.title` [setting](configuration.md#settings) moves the name to the
+front (`start`) or turns this off (`off`) — for instance for a tool that finds
+LabVIEW's windows by their exact title. A LabVIEW on the venv started some
+other way than `lvpm launch` is not tagged.
+
 ## Layout
 
 ```text
