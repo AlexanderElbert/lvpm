@@ -9,10 +9,10 @@
 //!
 //! ```toml
 //! [package]
-//! name = "nfg_lib_adlink_pxi_trigger"
+//! name = "acme_lib_example"
 //! version = "0.3.0.0"
-//! display-name = "ADLINK PXI Trigger"
-//! vendor = "NFG"
+//! display-name = "Example Library"
+//! vendor = "Acme"
 //! labview = "25.0"                      # minimum LabVIEW version
 //! output = "dist"                       # relative to lvpm.toml, default "dist"
 //! icon = "icon.bmp"                     # optional BMP; default: a plain 36x36 icon
@@ -22,7 +22,7 @@
 //!
 //! [[package.files]]
 //! source = "LabVIEW"                    # a folder (recursively) or a single file
-//! target = "vi.lib/NFG/ADLINK PXI Trigger"
+//! target = "vi.lib/Acme/Example Library"
 //! exclude = ["Report.html", "*.dll"]    # relative to source; `*` matches within a name
 //! ```
 
@@ -475,13 +475,13 @@ mod tests {
 
     const MANIFEST: &str = r#"
 [project]
-name = "adlink"
+name = "example"
 
 [package]
-name = "nfg_lib_adlink_pxi_trigger"
+name = "acme_lib_example"
 version = "0.3.0.1"
-display-name = "ADLINK PXI Trigger"
-vendor = "NFG"
+display-name = "Example Library"
+vendor = "Acme"
 summary = "Trigger routing"
 labview = "25.0"
 
@@ -492,12 +492,12 @@ exact_one = "1.2.3.4"
 
 [[package.files]]
 source = "LabVIEW"
-target = "vi.lib/NFG/ADLINK PXI Trigger"
+target = "vi.lib/Acme/Example Library"
 exclude = ["Report.html", "*.dll"]
 
 [[package.files]]
 source = "dist/wrapper64.dll"
-target = "vi.lib/NFG/ADLINK PXI Trigger/"
+target = "vi.lib/Acme/Example Library/"
 "#;
 
     fn sources() -> tempfile::TempDir {
@@ -515,7 +515,7 @@ target = "vi.lib/NFG/ADLINK PXI Trigger/"
     fn parses_the_package_table() {
         let dir = sources();
         let p = parse(MANIFEST, dir.path()).unwrap();
-        assert_eq!(p.file_name(), "nfg_lib_adlink_pxi_trigger-0.3.0.1.vip");
+        assert_eq!(p.file_name(), "acme_lib_example-0.3.0.1.vip");
         assert_eq!(p.output, dir.path().join("dist"));
         assert_eq!(
             p.requires,
@@ -529,10 +529,10 @@ target = "vi.lib/NFG/ADLINK PXI Trigger/"
         assert_eq!(
             paths,
             [
-                "vi.lib/NFG/ADLINK PXI Trigger/VIs/a.vi",
-                "vi.lib/NFG/ADLINK PXI Trigger/VIs/b.vi",
-                "vi.lib/NFG/ADLINK PXI Trigger/lib.lvlib",
-                "vi.lib/NFG/ADLINK PXI Trigger/wrapper64.dll",
+                "vi.lib/Acme/Example Library/VIs/a.vi",
+                "vi.lib/Acme/Example Library/VIs/b.vi",
+                "vi.lib/Acme/Example Library/lib.lvlib",
+                "vi.lib/Acme/Example Library/wrapper64.dll",
             ]
         );
     }
@@ -549,7 +549,7 @@ target = "vi.lib/NFG/ADLINK PXI Trigger/"
             .collect();
         assert_eq!(names.last().unwrap(), "spec", "spec is written last");
         let mut dll = String::new();
-        zip.by_name("File Group 0/vi.lib/NFG/ADLINK PXI Trigger/wrapper64.dll")
+        zip.by_name("File Group 0/vi.lib/Acme/Example Library/wrapper64.dll")
             .unwrap()
             .read_to_string(&mut dll)
             .unwrap();
@@ -562,9 +562,9 @@ target = "vi.lib/NFG/ADLINK PXI Trigger/"
             .unwrap();
         assert!(!text.replace("\r\n", "").contains('\n'), "CRLF only");
         let spec = crate::spec::parse(&text).unwrap();
-        assert_eq!(spec.name, "nfg_lib_adlink_pxi_trigger");
+        assert_eq!(spec.name, "acme_lib_example");
         assert_eq!(spec.version, "0.3.0.1");
-        assert_eq!(spec.display_name.as_deref(), Some("ADLINK PXI Trigger"));
+        assert_eq!(spec.display_name.as_deref(), Some("Example Library"));
         assert_eq!(spec.lv_gate.as_deref(), Some("LabVIEW>=25.0"));
         assert_eq!(
             spec.requires.as_deref(),
@@ -654,9 +654,9 @@ target = "vi.lib/NFG/ADLINK PXI Trigger/"
         for (from, to, needle) in [
             ("0.3.0.1", "0.3.x", "version"),
             ("0.3.0.1", "1.2.3.4.5", "version"),
-            ("nfg_lib_adlink_pxi_trigger", "bad name", "name"),
+            ("acme_lib_example", "bad name", "name"),
             (
-                "vi.lib/NFG/ADLINK PXI Trigger\"\nexclude",
+                "vi.lib/Acme/Example Library\"\nexclude",
                 "../outside\"\nexclude",
                 "inside the LabVIEW directory",
             ),
