@@ -21,6 +21,7 @@
 //! - Reading another process's titles does not involve that process; only a
 //!   rename reaches LabVIEW's UI thread, one per window per change.
 
+#[cfg(any(windows, test))]
 use crate::config::TitlePosition;
 
 /// The title `title` should have, tagged with `tag` at `pos`, or `None` when
@@ -29,6 +30,7 @@ use crate::config::TitlePosition;
 ///
 /// `None` for an unchanged title is what ends the loop of rename, title
 /// change event, rename.
+#[cfg(any(windows, test))]
 pub fn retitle(title: &str, tag: &str, pos: TitlePosition) -> Option<String> {
     if title.is_empty() || tag.is_empty() || pos == TitlePosition::Off {
         return None;
@@ -51,6 +53,7 @@ pub fn retitle(title: &str, tag: &str, pos: TitlePosition) -> Option<String> {
 /// `title` without the tag in any of the places `retitle` puts it — in
 /// front, at the end, or before a closing ` *` — and nowhere else, so a VI
 /// whose own name contains the tag's text keeps it.
+#[cfg(any(windows, test))]
 fn untagged(title: &str, tag: &str) -> String {
     let mut t = title;
     let front = format!("{tag} ");
