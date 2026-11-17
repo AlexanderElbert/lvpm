@@ -45,6 +45,8 @@ the two disagree, the Rust code is right and the Python needs updating.
 | Which link objects changed, and how? | `python tools/linkfix/linkobjs.py show "<vi>"` on both copies and compare: ident, qualifier, path type (`tp=0` absolute/token, `tp=1` relative), path, tail length |
 | Are the qualifier chains right? | `python tools/linkfix/qualcheck.py <venv store folder> [pkg filter]` (the store is the folder holding the package folders, for example `C:\Git\venv-check\.project`) |
 | Do a tree's declared dependencies resolve? Compare two trees by their dependency sets, not bytes? | `python tools/linkfix/deptree.py check <tree>` / `deptree.py compare <a> <b>` / `deptree.py show "<vi>"` |
+| Why does a project load slowly: dependency cycles between classes/libraries, how many files does each library pull in? | `python tools/linkfix/cycles.py cycles <source tree> [--json out.json]` |
+| Does a VI carry a leftover class link (in `LIvi` only) that is the sole reason a class loads? | `python tools/linkfix/cycles.py stale <source tree>` (exit 1 if any; a resave in LabVIEW drops the link) |
 | Are packages venv-ready (embedded compiled code, absolute or missing link paths)? | `python tools/linkfix/audit.py --manifest lvpm.toml` or `--installed <WHERE>` or package names; `--show absolute\|missing\|relative` |
 | Which VIs will LabVIEW want to save after loading? | `python tools/linkfix/predict_dirty.py --manifest lvpm.toml [--observed <venv store>]` |
 | Does LabVIEW still want to save this (linkfixed) VI? (needs LabVIEW) | `Save Buffer Probe.vi`, see "LabVIEW probes" below |
