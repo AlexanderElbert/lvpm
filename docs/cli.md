@@ -43,6 +43,7 @@ lvpm [--labview-version YYYY] [--prefix DIR | --project DIR] [--global] [--refre
   start                         [--wait SECS]
   launch [<lvproj>]             [--ini KEY=VALUE]... [--no-check]
   venv create [--manifest FILE] | status | remove [-y]
+  venv shortcut [<lvproj>]      [--desktop | --out PATH]
   config get <key> | set <key> [<value>...]
   cache add <path>
   import <vipm.toml | file.vipc> [--all] [--group G] [--dry-run]

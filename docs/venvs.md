@@ -61,6 +61,16 @@ pass done where `relink = true`, and PostInstall run where the hook policy
 runs it. It refuses on a mismatch and names each one; `--no-check` starts
 anyway. Files edited or resaved since install are not detected.
 
+`lvpm venv shortcut [<lvproj>]` writes a Windows shortcut,
+`<project> (LabVIEW <year> <bits>-bit).lnk`, that runs
+`lvpm --project <repo> launch [<lvproj>]` with LabVIEW's icon. The shortcut
+goes in the project folder by default. `--desktop` puts it on the desktop,
+and `--out PATH` takes a `.lnk` path or a folder. The shortcut runs `lvpm`,
+not `LabVIEW.exe`, because a shortcut cannot set the venv's temp directory and
+would skip the check above. When a launch from the shortcut fails, its console
+stays open until you press Enter. The shortcut records the full path of the
+`lvpm.exe` that wrote it, so recreate it if you move lvpm.
+
 ### The venv's name in window titles
 
 On Windows, `launch` also starts a small hidden `lvpm` beside the venv

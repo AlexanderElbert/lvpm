@@ -35,6 +35,7 @@ mod refresh;
 mod relink;
 mod resolve;
 mod shadow;
+mod shortcut;
 mod spec;
 mod target;
 mod update_notice;
@@ -344,6 +345,10 @@ enum Cmd {
         /// PostInstall hook still owed).
         #[arg(long)]
         no_check: bool,
+        /// Wait for Enter before exiting on an error, so a console opened by
+        /// a shortcut stays up long enough to read it.
+        #[arg(long, hide = true)]
+        pause_on_error: bool,
     },
     /// Keep a tag in the window titles of one LabVIEW until it exits.
     /// Started hidden by `launch`; see the `venv.title` setting.
@@ -436,6 +441,19 @@ enum VenvCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Write a Windows shortcut that runs `lvpm launch` on this venv, with
+    /// LabVIEW's icon. Goes in the project folder unless `--desktop` or
+    /// `--out` says otherwise.
+    Shortcut {
+        /// A `.lvproj` (or any LabVIEW file) the shortcut opens.
+        lvproj: Option<PathBuf>,
+        /// Put the shortcut on the desktop.
+        #[arg(long, conflicts_with = "out")]
+        desktop: bool,
+        /// Where to write the shortcut: a `.lnk` path, or a folder to put it in.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -465,6 +483,10 @@ fn main() -> Result<()> {
         notice.finish();
     }
     logging::finish(&result);
+    if let (Cmd::Launch { pause_on_error: true, .. }, Err(e)) = (&cli.cmd, &result) {
+        eprintln!("error: {e:#}\n\npress Enter to close");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
     result
 }
 
@@ -545,7 +567,7 @@ fn run(cli: &Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Launch { lvproj, ini_keys, no_check } => cmd_launch(&cli, lvproj.as_deref(), ini_keys, *no_check),
+        Cmd::Launch { lvproj, ini_keys, no_check, .. } => cmd_launch(&cli, lvproj.as_deref(), ini_keys, *no_check),
         Cmd::TitleWatch { pid, tag, position } => {
             let pos: config::TitlePosition = position.parse()?;
             #[cfg(windows)]
@@ -2744,6 +2766,30 @@ fn cmd_venv(cli: &Cli, sub: &VenvCmd) -> Result<()> {
                 bail!("no venv at or above {}", cwd.display());
             };
             venv::remove(&v, *yes)
+        }
+        VenvCmd::Shortcut { lvproj, desktop, out } => {
+            let Some(v) = venv::find(cli.project.as_deref(), &cwd)? else {
+                bail!("no venv at or above {} — `lvpm venv create` makes one", cwd.display());
+            };
+            let lvproj = match lvproj {
+                Some(p) => {
+                    let p = std::path::absolute(p)?;
+                    ensure!(p.is_file(), "no such project file: {}", p.display());
+                    Some(p)
+                }
+                None => None,
+            };
+            let name = shortcut::file_name(&v, lvproj.as_deref());
+            let lnk = match (out, desktop) {
+                (Some(p), _) if p.is_dir() => std::path::absolute(p)?.join(&name),
+                (Some(p), _) => std::path::absolute(p)?.with_extension("lnk"),
+                (None, true) => shortcut::desktop()?.join(&name),
+                (None, false) => v.repo.join(&name),
+            };
+            shortcut::create(&v, lvproj.as_deref(), &lnk)?;
+            log!("wrote {}", lnk.display());
+            log!("  runs           lvpm {}", shortcut::arguments(&v, lvproj.as_deref()));
+            Ok(())
         }
     }
 }
