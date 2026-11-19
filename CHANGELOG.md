@@ -4,11 +4,10 @@ What changed in each lvpm release. Downloads are on the
 [releases page](https://github.com/labview-package-manager/lvpm/releases);
 installing is described in [docs/installation.md](docs/installation.md).
 
-## 0.3.1-rc.2 - 2026-11-15
+## 0.3.1 - 2026-11-19
 
-Release candidate for 0.3.1. It lists everything since 0.2.1, the last stable
-release; 0.3.1-rc.1 was a pre-release to try the new release pipeline and
-carried no notes.
+First stable 0.3 release. It lists everything since 0.2.1, the last stable
+release; the release candidates 0.3.1-rc.1 to rc.3 led up to it.
 
 ### Upgrading from 0.2.x
 
@@ -90,6 +89,22 @@ Read this first: several things work differently.
 - **Settings.** `lvpm config get` and `set`, or `LVPM_CONFIG_*` environment
   variables: the cache folder, local package folders, the venv folder name
   and the log folder.
+- **Shared palette categories in a venv.** Packages that add menus to the
+  same palette category now all show up. lvpm keeps each package's menus apart
+  and merges them into one reserved `venv-palettes` addon on install,
+  uninstall and migration; `lvpm launch` refuses a stale merged tree (#26).
+- **The venv's name in LabVIEW's window titles.** `lvpm launch` starts a
+  hidden watcher that tags the venv LabVIEW's own windows with the project's
+  name, e.g. `Main.vi Front Panel on MyProject.lvproj/My Computer [MyProject]`.
+  The new `venv.title` setting puts it at the `end` (default), `start`, or
+  turns it `off`. Windows only.
+- **The venv's own icon and taskbar button.** Each venv gets `venv.ico`, the
+  bound LabVIEW's icon with a coloured badge chosen from the project's name,
+  and its own taskbar group, so a pinned button relaunches the venv through
+  `lvpm launch`.
+- **`lvpm venv shortcut [<lvproj>]`** writes a Windows shortcut that launches
+  the venv (`--desktop` or `--out PATH`). It runs `lvpm launch`, so the venv's
+  TEMP, the manifest check and the one-LabVIEW-per-venv guard all apply.
 - An install reports how long it and each of its phases took.
 
 ### Fixed
@@ -123,10 +138,17 @@ Read this first: several things work differently.
 
 The full list is in [docs/limitations.md](docs/limitations.md).
 
+## 0.3.1-rc.3 - 2026-11-19
+
+Pre-release of 0.3.1; its changes are listed under 0.3.1.
+
+## 0.3.1-rc.2 - 2026-11-15
+
+Pre-release of 0.3.1; its changes are listed under 0.3.1.
+
 ## 0.3.1-rc.1 - 2026-11-13
 
-Pre-release to try the new release pipeline: the MSI, the Linux build and the
-install scripts. Its changes are listed under 0.3.1-rc.2.
+Pre-release of 0.3.1; its changes are listed under 0.3.1.
 
 ## 0.2.1 - 2026-09-23
 
