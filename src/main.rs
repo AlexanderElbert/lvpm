@@ -1369,18 +1369,16 @@ fn cmd_list(cli: &Cli) -> Result<()> {
             policy.allows(&m.name)
                 && (post.ends_with("PENDING") || post.ends_with("FAILED") || post.ends_with("unknown") || post.ends_with("skipped")),
         );
-        // Records from before hook state was tracked list PostInstall here;
-        // the column above says what is known about it now.
-        let skipped: Vec<&String> = m.skipped_hooks.iter().filter(|h| !h.starts_with("PostInstall=")).collect();
+        // Hooks a venv can never run (PreInstall, the uninstall hooks) are not
+        // shown: there is nothing to do about them.
         log!(
-            "{:<52} {:<14} {:>5} files  {:<12} {:<20}{}",
+            "{:<52} {:<14} {:>5} files  {:<12} {}",
             m.name,
             m.version,
             m.files.len(),
             // Linkfix prepares every install; LabVIEW's relink is the opt-in exception.
             if m.relinked { "relinked" } else { "" },
             post,
-            if skipped.is_empty() { String::new() } else { format!("  (hooks not run: {})", hook_names(skipped)) }
         );
     }
     if owed > 0 {
@@ -1686,12 +1684,9 @@ fn uninstall_one(
                 && (h.starts_with("PreUninstall=") || h.starts_with("PostUninstall="))
         })
         .collect();
-    if !unrun.is_empty() {
-        let why = match hooks {
-            true => "installed before uninstall hooks existed",
-            false => "hooks do not run in a venv",
-        };
-        log!("note: declared but not run ({why}): {}", hook_names(unrun));
+    // In a venv they never run; nothing to say about that.
+    if !unrun.is_empty() && hooks {
+        log!("note: declared but not run (installed before uninstall hooks existed): {}", hook_names(unrun));
     }
     Ok(removed)
 }
@@ -2118,13 +2113,13 @@ fn cmd_install(
         // Warn only about hooks this install owes and will not run. Allowed
         // globally, PreInstall has run, PostInstall runs after the relink
         // pass, and the uninstall hooks are extracted for `lvpm uninstall` —
-        // nothing to say. In a venv PreInstall cannot run (see above); a
-        // package the policy holds back runs none, so every declared one is
-        // reported.
+        // nothing to say. A package the policy holds back runs none, so every
+        // declared one is reported. Hooks a venv can never run (PreInstall)
+        // are not: there is nothing to do about them.
         let skipped: Vec<String> = spec
             .script_vis
             .iter()
-            .filter(|(h, _)| !policy.allows(&e.name) || (h == "PreInstall" && venv.is_some()))
+            .filter(|(_, _)| !policy.allows(&e.name))
             .map(|(h, v)| format!("{h}={v}"))
             .collect();
         if !skipped.is_empty() {
