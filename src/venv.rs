@@ -1,12 +1,13 @@
 //! A project's own package tree — the LabVIEW counterpart of a virtualenv.
 //!
 //! `.lv-venv/packages/` by default is an LVAddons *location*: one addon per
-//! package, each mirroring the LabVIEW install dir under `<pkg>/1/`. A LabVIEW
-//! started with `LVAddons.AdditionalLocations` pointing here overlays them onto
-//! its own tree, so a package in the venv links exactly as it would from the
-//! real `vi.lib` — `<vilib>`-relative, portable — while the installation stays
-//! untouched. Starting that LabVIEW is [`crate::launch`]'s job; this module is
-//! the binding on disk, and how a command finds the venv it means.
+//! package, each mirroring the LabVIEW install dir under `<pkg>/1/`, plus one
+//! reserved addon for merged menus. A LabVIEW started with
+//! `LVAddons.AdditionalLocations` pointing here overlays them onto its own tree,
+//! so a package in the venv links exactly as it would from the real `vi.lib` —
+//! `<vilib>`-relative, portable — while the installation stays untouched.
+//! Starting that LabVIEW is [`crate::launch`]'s job; this module is the binding
+//! on disk, and how a command finds the venv it means.
 //!
 //! No activation step. Like cargo and npm, a command run anywhere inside a
 //! project uses that project's venv; `--project <DIR>` names one from outside,
@@ -86,10 +87,10 @@ impl Venv {
 
     /// Roots for installing one package: its own addon under the venv.
     pub fn roots_for_pkg(&self, pkg: &str) -> Result<Roots> {
+        crate::palette::validate_package_name(pkg)?;
         ensure!(
-            !pkg.is_empty() && pkg != "." && pkg != ".."
-                && pkg.chars().all(|c| c.is_ascii_alphanumeric() || "._-&".contains(c)),
-            "package name {pkg:?} cannot be an addon folder name"
+            !pkg.eq_ignore_ascii_case(crate::palette::ADDON_NAME),
+            "package name {pkg:?} is reserved for lvpm's merged palette addon"
         );
         Ok(Roots::project(&self.dir, &self.target, pkg))
     }

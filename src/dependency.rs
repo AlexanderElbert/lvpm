@@ -195,6 +195,7 @@ mod tests {
             installed_at: 0,
             target: "test".into(),
             files: vec![],
+            palette_files: vec![],
             dependencies: deps
                 .expect("test packages declare dependencies")
                 .iter()

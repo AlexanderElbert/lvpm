@@ -36,6 +36,10 @@ pub struct Manifest {
     pub target: String,
     /// Absolute paths, forward-slashed.
     pub files: Vec<String>,
+    /// Palette files staged outside mounted package addons, by path within
+    /// the package's original `menus/` tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub palette_files: Vec<PaletteFile>,
     /// Direct package requirements, including an empty list when there are none.
     pub dependencies: Vec<String>,
     /// Hooks the package declares that were not run: every one in a venv
@@ -84,6 +88,11 @@ pub struct Manifest {
     pub skipped_groups: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaletteFile {
+    pub relative: String,
+}
+
 /// What an install *would* do. Produced first so `--dry-run` and the real run
 /// share one code path.
 #[derive(Debug)]
@@ -97,6 +106,7 @@ pub struct Plan {
     /// Groups not written because a venv holds LabVIEW-tree content only:
     /// the `Target Dir` and how many files it named.
     pub skipped_groups: Vec<(String, usize)>,
+    pub palette_files: Vec<PaletteFile>,
 }
 
 #[derive(Debug)]
@@ -203,6 +213,7 @@ pub fn plan(roots: &Roots, spec: &Spec, zip: &mut Archive) -> Result<Plan> {
     let mut kept = Vec::new();
     let mut missing = Vec::new();
     let mut skipped = Vec::new();
+    let mut palette_files = Vec::new();
 
     for group in &spec.file_groups {
         if group.files.is_empty() {
@@ -216,11 +227,25 @@ pub fn plan(roots: &Roots, spec: &Spec, zip: &mut Archive) -> Result<Plan> {
             skipped.push((group.target_dir.clone(), group.files.len()));
             continue;
         }
-        let dest_root = roots.expand(&group.target_dir)?;
+        let menu_relative_root = if roots.venv().is_some() {
+            crate::palette::menu_relative_root(&group.target_dir)?
+        } else {
+            None
+        };
+        if menu_relative_root.is_some() {
+            crate::palette::validate_package_name(&spec.name)?;
+        }
+        let dest_root = match &menu_relative_root {
+            Some(relative) => crate::palette::contribution_root(roots, &spec.name).join(relative),
+            None => roots.expand(&group.target_dir)?,
+        };
         let if_newer = group.replace_mode.eq_ignore_ascii_case("If Newer");
 
         for rel in &group.files {
             let rel_path = safe_relative(rel)?;
+            let palette_relative = menu_relative_root
+                .as_ref()
+                .map(|base| base.join(&rel_path).to_string_lossy().replace('\\', "/"));
             let entry_name = format!("File Group {}/{}", group.index, rel.replace('\\', "/"));
 
             let Some(&zip_index) = by_lower.get(&entry_name.to_lowercase()) else {
@@ -237,13 +262,19 @@ pub fn plan(roots: &Roots, spec: &Spec, zip: &mut Archive) -> Result<Plan> {
                 // Doing it properly means comparing the archive timestamp
                 // against the file on disk.
                 kept.push(dest);
+                if let Some(relative) = &palette_relative {
+                    palette_files.push(PaletteFile { relative: relative.clone() });
+                }
                 continue;
+            }
+            if let Some(relative) = &palette_relative {
+                palette_files.push(PaletteFile { relative: relative.clone() });
             }
             writes.push(PlannedWrite { zip_index, dest, overwrites: exists });
         }
     }
 
-    Ok(Plan { writes, kept, missing_from_archive: missing, skipped_groups: skipped })
+    Ok(Plan { writes, kept, missing_from_archive: missing, skipped_groups: skipped, palette_files })
 }
 
 /// The `lvaddoninfo.json` LabVIEW reads to mount an addon (fields as NI's own
@@ -308,7 +339,7 @@ pub fn apply(
     // package whose every group aimed at the machine leaves no addon at all.
     if roots.venv().is_some()
         && let Some(t) = &roots.target
-        && !written.is_empty()
+        && written.iter().any(|file| Path::new(file).starts_with(&roots.application))
     {
         let info = roots.application.join("lvaddoninfo.json");
         std::fs::create_dir_all(&roots.application)?;
@@ -330,6 +361,7 @@ pub fn apply(
             None => format!("scratch {}", roots.application.display()),
         },
         files: written,
+        palette_files: plan.palette_files.clone(),
         dependencies,
         // PostInstall is not listed: its state is `post_install`. In a venv
         // PreInstall cannot run (its LabVIEW starts after the copy) and the
@@ -386,7 +418,7 @@ pub fn extract_hook(
     Ok(Some(dest))
 }
 
-fn write_manifest(roots: &Roots, m: &Manifest) -> Result<()> {
+pub(crate) fn write_manifest(roots: &Roots, m: &Manifest) -> Result<()> {
     let mp = manifest_path(roots, &m.name);
     std::fs::create_dir_all(mp.parent().unwrap())?;
     std::fs::write(&mp, serde_json::to_string_pretty(m)?)?;
@@ -523,6 +555,7 @@ mod tests {
         let manifest = Manifest {
             name: "example".into(), version: "1".into(), display_name: None, installed_at: 0,
             target: "test".into(), files: vec![payload.to_string_lossy().into_owned()], dependencies: vec![],
+            palette_files: vec![],
             skipped_hooks: vec![], relinked: false, relink_folders: vec![],
             post_install_vi: None, post_install: None, pre_install_vi: None, pre_uninstall_vi: None,
             post_uninstall_vi: None, skipped_groups: vec![],
@@ -578,5 +611,44 @@ mod tests {
         assert_eq!(v["ApiVersion"], "v1");
         assert_eq!(v["MinimumSupportedLVVersion"], "26.0");
         assert_eq!(v["SupportedBitness"], "64");
+    }
+
+    #[test]
+    fn venv_menu_files_are_recorded_in_the_private_contribution_store() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("lvpm-palette-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = LvTarget { version: 26.3, bitness: 64, path: dir.join("LabVIEW") };
+        let roots = Roots::project(&dir, &target, "example");
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer.start_file("File Group 0/functions.mnu", zip::write::SimpleFileOptions::default()).unwrap();
+        writer.write_all(b"menu").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut zip = open_archive(bytes).unwrap();
+        let spec = crate::spec::parse(
+            r#"[Package]
+Name="example"
+Version="1"
+
+[File Group 0]
+Target Dir="<menus>/Categories"
+Num Files=1
+File 0="functions.mnu"
+"#,
+        )
+        .unwrap();
+
+        let plan = plan(&roots, &spec, &mut zip).unwrap();
+        let source = crate::palette::contribution_root(&roots, "example").join("Categories/functions.mnu");
+        assert_eq!(plan.writes[0].dest, source);
+        assert_eq!(plan.palette_files, [PaletteFile { relative: "Categories/functions.mnu".into() }]);
+        let manifest = apply(&roots, &spec, &mut zip, &plan, None, Vec::new()).unwrap();
+
+        assert!(source.is_file());
+        assert!(!roots.application.join("lvaddoninfo.json").exists());
+        assert!(manifest.files.iter().any(|file| PathBuf::from(file) == source));
+        assert_eq!(manifest.palette_files, plan.palette_files);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

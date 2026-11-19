@@ -30,6 +30,7 @@ mod index;
 mod install;
 mod launch;
 mod linkfix;
+mod palette;
 mod project;
 mod refresh;
 mod relink;
@@ -1515,16 +1516,24 @@ fn cmd_uninstall(
     // the end — the hooks are per package, the rebuild is not.
     let mut conn: Option<viserver::Connection> = None;
     let mut removed_any = false;
+    let mut uninstalled_any = false;
     let mut failed: Vec<(String, anyhow::Error)> = Vec::new();
     for (i, name) in names.iter().enumerate() {
         match uninstall_one(&roots, name, &mut conn) {
-            Ok(removed) => removed_any |= removed > 0,
+            Ok(removed) => {
+                removed_any |= removed > 0;
+                uninstalled_any = true;
+            }
             // One bad package must not strand the rest of an --all sweep. A
             // single named package still fails the command with its own error.
             Err(e) => {
                 if !all {
                     if named_package_removed_before(i) {
                         unsave_now();
+                        if roots.venv().is_some() {
+                            palette::reconcile(&roots)
+                                .context("the named package was removed, but venv palettes could not be reconciled")?;
+                        }
                     }
                     return Err(e);
                 }
@@ -1542,6 +1551,10 @@ fn cmd_uninstall(
     // Only reached when the named package was removed: a failure of its own
     // returned above, and one of a dependency edited the manifest on the way out.
     unsave_now();
+
+    if uninstalled_any && roots.venv().is_some() {
+        palette::reconcile(&roots).context("packages were removed, but venv palettes could not be reconciled")?;
+    }
 
     // The same reason as on install, in reverse: the packages' `.mnu` files
     // are gone, but LabVIEW still shows the palette entries until told. Not
@@ -1853,6 +1866,13 @@ fn cmd_install(
     }
 
     let plan = resolution.plan;
+    if venv.is_some() {
+        ensure!(
+            !plan.iter().any(|entry| entry.name.eq_ignore_ascii_case(palette::ADDON_NAME)),
+            "package name {:?} is reserved for lvpm's merged palette addon",
+            palette::ADDON_NAME
+        );
+    }
 
     // What the install does with each package of the plan, settled once:
     // the fetch below and the manifest entry both follow from it.
@@ -1952,6 +1972,10 @@ fn cmd_install(
     // against a dependency that is not there yet.
     let mut relink_work: Vec<(String, Vec<PathBuf>)> = Vec::new();
     let mut linkfix_files = Vec::new();
+
+    if !dry_run && venv.is_some() {
+        palette::reconcile(&store).context("migrating and reconciling existing venv palettes")?;
+    }
 
     for e in &plan {
         // In a venv every package is an addon of its own; the store is shared.
@@ -2091,6 +2115,9 @@ fn cmd_install(
             log!("      hooks not run: {}", hook_names(&skipped));
             hooks_unrun = true;
         }
+    }
+    if !dry_run && venv.is_some() {
+        palette::reconcile(&store).context("reconciling venv palettes after install")?;
     }
     if hooks_unrun && hook_mode == HookMode::Default {
         log!(
@@ -2834,7 +2861,7 @@ fn check_venv_for_launch(cli: &Cli, dest: &Destination, v: &venv::Venv) -> Resul
     let wanted = proj.select(&[], &[], &[])?.dependencies;
     let store = v.store();
     let policy = hook_policy_for(cli, dest, HookMode::Default)?;
-    let problems = venv_problems(
+    let mut problems = venv_problems(
         &wanted,
         &proj.relink,
         |name| policy.allows(name),
@@ -2844,6 +2871,9 @@ fn check_venv_for_launch(cli: &Cli, dest: &Destination, v: &venv::Venv) -> Resul
         },
         |p| p.exists(),
     )?;
+    if let Err(error) = palette::verify(&store) {
+        problems.push((format!("palettes: {error:#}"), Fix::Install));
+    }
     if problems.is_empty() {
         elog!("checked {} package(s) against {}", wanted.len(), path.display());
         return Ok(());
