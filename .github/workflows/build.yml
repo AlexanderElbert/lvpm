@@ -106,8 +106,9 @@ jobs:
           path: target/${{ matrix.target }}/release/lvpm-e2e${{ runner.os == 'Windows' && '.exe' || '' }}
           if-no-files-found: error
 
-  # THIRD-PARTY-LICENSES.txt ships with every release (dist-workspace.toml),
-  # so it must list the crates the current Cargo.lock builds in.
+  # The release generates THIRD-PARTY-LICENSES.txt (.github/build-setup.yml).
+  # Generating it here too fails a change that brings in a dependency under a
+  # license about.toml does not accept, before a release would.
   notices:
     runs-on: ubuntu-latest
     steps:
@@ -119,13 +120,8 @@ jobs:
         with:
           tool: cargo-about
 
-      - name: Third-party notices are current
-        run: |
-          cargo about generate --locked -o THIRD-PARTY-LICENSES.txt about.hbs
-          git diff --exit-code --ignore-cr-at-eol -- THIRD-PARTY-LICENSES.txt || {
-            echo "::error::THIRD-PARTY-LICENSES.txt is stale: run cargo about generate --locked -o THIRD-PARTY-LICENSES.txt about.hbs"
-            exit 1
-          }
+      - name: Third-party notices generate
+        run: cargo about generate --locked -o THIRD-PARTY-LICENSES.txt about.hbs
 
   # Both executables in one download, named for the version and commit, to
   # hand to testers, each with the relink VI it needs beside it. The Linux one

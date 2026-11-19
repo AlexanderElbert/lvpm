@@ -131,6 +131,13 @@ jobs:
         if: "runner.os == 'Linux'"
         run: "echo \"CC_x86_64_unknown_linux_musl=musl-gcc\" >> \"$GITHUB_ENV\""
         shell: "bash"
+      - name: "Install cargo-about"
+        uses: "taiki-e/install-action@v2"
+        with:
+          "tool": "cargo-about"
+      - name: "Generate THIRD-PARTY-LICENSES.txt"
+        run: "cargo about generate --locked -o THIRD-PARTY-LICENSES.txt about.hbs"
+        shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
