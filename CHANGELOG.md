@@ -89,10 +89,15 @@ Read this first: several things work differently.
 - **Settings.** `lvpm config get` and `set`, or `LVPM_CONFIG_*` environment
   variables: the cache folder, local package folders, the venv folder name
   and the log folder.
-- **Shared palette categories in a venv.** Packages that add menus to the
-  same palette category now all show up. lvpm keeps each package's menus apart
-  and merges them into one reserved `venv-palettes` addon on install,
-  uninstall and migration; `lvpm launch` refuses a stale merged tree (#26).
+- **Shared palette categories in a venv.** Packages that add to the same
+  palette category now all show up, in the Functions and Controls palettes
+  (`<menus>`) and in the Addons palette (`.mnu` files under
+  `<vi.lib>\addons`, such as the HSE packages' shared `HSE` category). lvpm
+  keeps each package's palette files apart and merges them into one reserved
+  `venv-palettes` addon on install, uninstall and migration; `lvpm launch`
+  refuses a stale merged tree, and one `lvpm install` rebuilds it (#26). When
+  packages ship different `dir.mnu` files for one category, the install says
+  whose it kept.
 - **The venv's name in LabVIEW's window titles.** `lvpm launch` starts a
   hidden watcher that tags the venv LabVIEW's own windows with the project's
   name, e.g. `Main.vi Front Panel on MyProject.lvproj/My Computer [MyProject]`.
