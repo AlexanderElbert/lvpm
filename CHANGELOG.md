@@ -128,6 +128,10 @@ Read this first: several things work differently.
 - Commands outside a venv write their log as they go, so an interrupted run
   keeps what it logged.
 - `lvpm venv status` in a project without a venv says so instead of failing.
+- `lvpm venv create` no longer fails with "stream did not contain valid UTF-8"
+  on a `LabVIEW.ini` that is not UTF-8. LabVIEW writes the file in the ANSI
+  code page, and LabVIEW 2025 was seen writing stray bytes into key names;
+  the venv's copy keeps them byte for byte.
 - Security updates of the `zip` and TLS libraries.
 
 ### Known limitations
