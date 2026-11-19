@@ -832,14 +832,39 @@ pub fn reconcile(roots: &Roots) -> Result<bool> {
     };
     record_migration(roots, &mut manifests, &legacy)?;
 
-    // Said when the tree is (re)built, not on every reconcile that finds it current.
+    // Said when the tree is (re)built, not on every reconcile that finds it
+    // current: at most two lines on screen, the details in the log.
     if changed {
+        let packages: HashSet<String> =
+            entries.iter().map(|e| e.package.to_ascii_lowercase()).collect();
+        let moved = match legacy.len() {
+            0 => String::new(),
+            n => format!("; moved {n} out of the package addons"),
+        };
+        log!(
+            "palettes: merged {} file(s) from {} package(s){moved}",
+            merged.len(),
+            packages.len()
+        );
+        if !choices.is_empty() {
+            log!(
+                "palettes: {} shared dir.mnu differ between packages; kept the first by name (see the log)",
+                choices.len()
+            );
+        }
         for choice in &choices {
-            wlog!(
+            log::info!(
                 "palettes: packages ship different {}; using {}'s, not {}'s",
                 choice.relative,
                 choice.kept,
                 choice.dropped.join("'s, ")
+            );
+        }
+        for file in &legacy {
+            log::info!(
+                "palettes: moved {}'s {} to its palette contribution",
+                file.package,
+                file.path.display()
             );
         }
     }

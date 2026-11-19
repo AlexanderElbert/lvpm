@@ -2208,13 +2208,14 @@ fn cmd_install(
                 None => by_reason.push((why, vec![n])),
             }
         }
+        // A count on screen; which packages is `lvpm list`'s job, and the log's.
         for (why, names) in by_reason {
             log!(
-                "\n{} post-install hook(s) {} ({why}): {}",
+                "\n{} post-install hook(s) {} ({why}); `lvpm list` shows which",
                 names.len(),
                 if dry_run { "would not run" } else { "not run" },
-                names.join(", ")
             );
+            log::info!("post-install hooks held back ({why}): {}", names.join(", "));
         }
     }
 
@@ -2433,10 +2434,13 @@ fn cmd_run_hooks(cli: &Cli, package: Option<&str>, all: bool, timeout: u64) -> R
         let (allowed, held): (Vec<_>, Vec<_>) = work.into_iter().partition(|m| policy.allows(&m.name));
         if !held.is_empty() {
             log!(
-                "not running {} hook(s) the policy holds back ({}): {}\n      \
+                "not running {} hook(s) the policy holds back ({}); `lvpm list` shows which\n      \
                  `lvpm run-hooks <package>` runs one anyway",
                 held.len(),
                 policy.why_not(&held[0].name),
+            );
+            log::info!(
+                "hooks held back: {}",
                 held.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", ")
             );
         }
