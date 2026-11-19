@@ -100,9 +100,8 @@ other way than `lvpm launch` is not tagged.
 
 The same watcher gives the venv LabVIEW's windows an icon and a taskbar
 button of their own. The icon is the bound LabVIEW's icon with a coloured disc
-in the upper right, carrying the project's initial from 32 px up. The colour
-comes from the project folder's name, so two venvs differ and each keeps its
-colour. lvpm writes it to `.lv-venv\venv.ico` at each launch and for
+in the upper right. The colour comes from the project folder's name, so two
+venvs differ and each keeps its colour. lvpm writes it to `.lv-venv\venv.ico` at each launch and for
 `venv shortcut`. It shows in the title bars, on the taskbar and in Alt+Tab.
 
 LabVIEW groups all its windows under one taskbar button per LabVIEW

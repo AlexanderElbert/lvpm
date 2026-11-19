@@ -5,8 +5,8 @@
 //! disc in the upper right (LabVIEW 2026 puts its version number in the lower
 //! right), half the icon's width, ringed in white so it reads
 //! on LabVIEW's artwork; its colour is picked from the project's name, so two
-//! venvs differ and one venv keeps its colour. From 32 px up it carries the
-//! project's initial; below that a letter is a smudge and colour has to do.
+//! venvs differ and one venv keeps its colour. No letter: at taskbar sizes it
+//! was unreadable, and the colour alone tells venvs apart.
 
 use crate::venv::Venv;
 use anyhow::Result;
@@ -43,11 +43,6 @@ fn badge_color(name: &str) -> [u8; 3] {
     PALETTE[(fnv1a(&name.to_lowercase()) % PALETTE.len() as u64) as usize]
 }
 
-/// The initial on the badge: the first letter or digit of the name.
-fn initial(name: &str) -> Option<char> {
-    name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().next().unwrap_or(c))
-}
-
 /// Where the venv's icon lives.
 pub fn path(v: &Venv) -> PathBuf {
     v.dir.join("venv.ico")
@@ -60,13 +55,11 @@ pub fn write(v: &Venv) -> Result<PathBuf> {
     use anyhow::Context;
     let name = project_name(v);
     let color = badge_color(&name);
-    let letter = initial(&name);
     let exe = v.target.exe();
     let mut images = Vec::new();
     for size in SIZES {
         let mut px = win::extract(&exe, size).with_context(|| format!("reading the icon of {}", exe.display()))?;
-        let glyph = letter.filter(|_| size >= 32).map(|c| win::glyph(c, badge_diameter(size)));
-        draw_badge(&mut px, size, color, glyph.as_ref());
+        draw_badge(&mut px, size, color);
         images.push((size, px));
     }
     let out = path(v);
@@ -88,13 +81,6 @@ fn badge_diameter(size: u32) -> u32 {
 /// straight (not premultiplied) alpha — the layout an icon stores.
 type Pixels = Vec<[u8; 4]>;
 
-/// Coverage mask for the letter, `d`×`d`, 0–255.
-#[cfg_attr(not(windows), allow(dead_code))]
-struct Glyph {
-    d: u32,
-    coverage: Vec<u8>,
-}
-
 /// Paint `src` (RGB, coverage `a` 0..1) over the pixel `dst`.
 fn blend(dst: &mut [u8; 4], src: [u8; 3], a: f32) {
     if a <= 0.0 {
@@ -107,7 +93,7 @@ fn blend(dst: &mut [u8; 4], src: [u8; 3], a: f32) {
 }
 
 /// The badge, anti-aliased by distance from the disc's edge.
-fn draw_badge(px: &mut Pixels, size: u32, color: [u8; 3], glyph: Option<&Glyph>) {
+fn draw_badge(px: &mut Pixels, size: u32, color: [u8; 3]) {
     let d = badge_diameter(size) as f32;
     let r = d / 2.0;
     let ring = (size as f32 / 20.0).max(1.0);
@@ -120,12 +106,6 @@ fn draw_badge(px: &mut Pixels, size: u32, color: [u8; 3], glyph: Option<&Glyph>)
             let p = &mut px[(y * size + x) as usize];
             blend(p, [255, 255, 255], (r - dist + 0.5).clamp(0.0, 1.0));
             blend(p, color, (r - ring - dist + 0.5).clamp(0.0, 1.0));
-            if let Some(g) = glyph {
-                let (gx, gy) = (x - x0, y);
-                if gx < g.d && gy < g.d {
-                    blend(p, [255, 255, 255], g.coverage[(gy * g.d + gx) as usize] as f32 / 255.0);
-                }
-            }
         }
     }
 }
@@ -181,7 +161,7 @@ fn encode_ico(images: &[(u32, Pixels)]) -> Vec<u8> {
 
 #[cfg(windows)]
 mod win {
-    use super::{Glyph, Pixels};
+    use super::Pixels;
     use anyhow::{Result, bail};
     use std::ffi::c_void;
     use std::path::Path;
@@ -218,20 +198,11 @@ mod win {
         colors: [u32; 3],
     }
 
-    #[repr(C)]
-    struct Rect {
-        left: i32,
-        top: i32,
-        right: i32,
-        bottom: i32,
-    }
-
     #[link(name = "user32")]
     unsafe extern "system" {
         fn PrivateExtractIconsW(file: *const u16, index: i32, cx: i32, cy: i32, icons: *mut Handle, ids: *mut u32, n: u32, flags: u32) -> u32;
         fn GetIconInfo(icon: Handle, info: *mut IconInfo) -> i32;
         fn DestroyIcon(icon: Handle) -> i32;
-        fn DrawTextW(dc: Handle, text: *const u16, len: i32, rect: *mut Rect, format: u32) -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -239,25 +210,10 @@ mod win {
         fn CreateCompatibleDC(dc: Handle) -> Handle;
         fn DeleteDC(dc: Handle) -> i32;
         fn GetDIBits(dc: Handle, bm: Handle, start: u32, lines: u32, bits: *mut c_void, info: *mut BitmapInfo, usage: u32) -> i32;
-        fn CreateDIBSection(dc: Handle, info: *const BitmapInfo, usage: u32, bits: *mut *mut c_void, section: Handle, offset: u32) -> Handle;
-        fn SelectObject(dc: Handle, obj: Handle) -> Handle;
         fn DeleteObject(obj: Handle) -> i32;
-        fn CreateFontW(
-            h: i32, w: i32, esc: i32, orient: i32, weight: i32, italic: u32, underline: u32, strike: u32,
-            charset: u32, out_prec: u32, clip_prec: u32, quality: u32, pitch: u32, face: *const u16,
-        ) -> Handle;
-        fn SetTextColor(dc: Handle, color: u32) -> u32;
-        fn SetBkMode(dc: Handle, mode: i32) -> i32;
     }
 
     const DIB_RGB_COLORS: u32 = 0;
-    const FW_BOLD: i32 = 700;
-    const ANTIALIASED_QUALITY: u32 = 4;
-    const TRANSPARENT: i32 = 1;
-    const DT_CENTER: u32 = 0x1;
-    const DT_VCENTER: u32 = 0x4;
-    const DT_SINGLELINE: u32 = 0x20;
-    const DT_NOPREFIX: u32 = 0x800;
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -340,42 +296,6 @@ mod win {
             (lines == size as i32).then_some(px)
         }
     }
-
-    /// `c` drawn white on black in a `d`×`d` square, bold Segoe UI, as a
-    /// coverage mask. Grey anti-aliasing, not ClearType, so any channel is
-    /// the coverage.
-    pub fn glyph(c: char, d: u32) -> Glyph {
-        let mut coverage = vec![0u8; (d * d) as usize];
-        let bi = header(d);
-        // SAFETY: GDI objects created here are selected out and deleted
-        // before return; `bits` points at d² pixels while the section lives.
-        unsafe {
-            let dc = CreateCompatibleDC(std::ptr::null_mut());
-            let mut bits: *mut c_void = std::ptr::null_mut();
-            let section = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
-            if !section.is_null() && !bits.is_null() {
-                let old_bm = SelectObject(dc, section);
-                let face = wide("Segoe UI");
-                let font = CreateFontW(-((d as f32 * 0.62) as i32), 0, 0, 0, FW_BOLD, 0, 0, 0, 0, 0, 0, ANTIALIASED_QUALITY, 0, face.as_ptr());
-                let old_font = SelectObject(dc, font);
-                SetTextColor(dc, 0x00FF_FFFF);
-                SetBkMode(dc, TRANSPARENT);
-                let text: Vec<u16> = c.to_string().encode_utf16().collect();
-                let mut rect = Rect { left: 0, top: 0, right: d as i32, bottom: d as i32 };
-                DrawTextW(dc, text.as_ptr(), text.len() as i32, &mut rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                let px = std::slice::from_raw_parts(bits as *const [u8; 4], (d * d) as usize);
-                for (c, p) in coverage.iter_mut().zip(px) {
-                    *c = p[0].max(p[1]).max(p[2]);
-                }
-                SelectObject(dc, old_font);
-                DeleteObject(font);
-                SelectObject(dc, old_bm);
-                DeleteObject(section);
-            }
-            DeleteDC(dc);
-        }
-        Glyph { d, coverage }
-    }
 }
 
 #[cfg(test)]
@@ -386,12 +306,6 @@ mod tests {
     fn fnv1a_is_the_published_function() {
         assert_eq!(fnv1a(""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a("a"), 0xaf63_dc4c_8601_ec8c);
-    }
-
-    #[test]
-    fn initial_skips_punctuation() {
-        assert_eq!(initial("_my-proj"), Some('M'));
-        assert_eq!(initial("--"), None);
     }
 
     #[test]
