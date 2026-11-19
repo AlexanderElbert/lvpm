@@ -122,9 +122,9 @@ exits.
 ```text
 .lv-venv/
   packages/<pkg>/1/    package addon and its mirrored LabVIEW tree
-  packages/venv-palettes/1/ merged `menus/` tree
+  packages/venv-palettes/1/ merged `menus/` and `vi.lib/addons/` palette trees
   palettes/
-    contributions/<pkg>/menus/  original package menu trees, outside the mount
+    contributions/<pkg>/  each package's palette files, outside the mount
   installed/           package installation records
   venv.json            LabVIEW binding
   labview.ini          venv-specific LabVIEW settings
@@ -176,8 +176,12 @@ flowchart TD
     q2 -- no --> a3["Missing: LabVIEW cannot find it."]
 ```
 
-Package `menus/` trees are stored outside the mounted addon location and
-reconciled into `packages/venv-palettes/1/menus/`. This gives shared category
+Package palette files are stored outside the mounted addon location and
+reconciled into `packages/venv-palettes/1/`: everything a package installs to
+`<menus>`, and the `.mnu` files it installs under `<vi.lib>\addons` (the
+Addons palette; the VIs beside them stay in the package's addon). Several
+packages often add to one Addons category, such as `addons\HSE`, and LabVIEW
+shows only one addon's copy of a folder. This gives shared category
 paths one addon provider while keeping each package's contribution available
 for upgrades, verification and uninstall. Byte-identical files are
 deduplicated. When contributors provide different `dir.mnu` files at the same
@@ -191,10 +195,10 @@ An addon that already matches is not rewritten, so an install with no palette
 changes never touches the folder a running LabVIEW has mounted. A running
 venv LabVIEW reads palettes at startup; after a change lvpm says to restart
 it. `lvpm install` migrates existing
-package-local menu files automatically. It does not change package archives
+package-local palette files automatically. It does not change package archives
 or the global LabVIEW installation. lvpm preserves the menu tree's relative
 paths but does not parse opaque `.mnu` contents: absolute references, paths
-that escape `menus/`, and other internal resource references are not validated
+that escape the tree, and other internal resource references are not validated
 and may not survive relocation. The launch check verifies the merged files and
 addon metadata, not palette visibility inside the LabVIEW IDE.
 

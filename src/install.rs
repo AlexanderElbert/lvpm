@@ -88,9 +88,41 @@ pub struct Manifest {
     pub skipped_groups: Vec<String>,
 }
 
+/// Which tree of the merged palette addon a palette file belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PaletteTree {
+    /// `<menus>`: the Functions and Controls palette trees.
+    #[default]
+    #[serde(rename = "menus")]
+    Menus,
+    /// `.mnu` files under `<vi.lib>\addons`, the Addons palette. Several
+    /// packages share a category folder there (`addons\HSE`), and LabVIEW
+    /// shows only one addon's copy of a folder.
+    #[serde(rename = "vi.lib/addons")]
+    Addons,
+}
+
+impl PaletteTree {
+    /// The tree's folder, relative to an addon root.
+    pub fn dir(self) -> &'static str {
+        match self {
+            PaletteTree::Menus => "menus",
+            PaletteTree::Addons => "vi.lib/addons",
+        }
+    }
+
+    fn is_menus(&self) -> bool {
+        *self == PaletteTree::Menus
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaletteFile {
+    /// Relative to the tree's folder.
     pub relative: String,
+    /// Absent in records from before `vi.lib/addons` palettes were merged.
+    #[serde(default, skip_serializing_if = "PaletteTree::is_menus")]
+    pub tree: PaletteTree,
 }
 
 /// What an install *would* do. Produced first so `--dry-run` and the real run
@@ -227,25 +259,30 @@ pub fn plan(roots: &Roots, spec: &Spec, zip: &mut Archive) -> Result<Plan> {
             skipped.push((group.target_dir.clone(), group.files.len()));
             continue;
         }
-        let menu_relative_root = if roots.venv().is_some() {
-            crate::palette::menu_relative_root(&group.target_dir)?
-        } else {
-            None
+        // In a venv, palette files go to the package's contribution and are
+        // merged into the shared palette addon: all of a `<menus>` group, and
+        // the `.mnu` files of a `<vi.lib>\addons` group (its VIs stay put).
+        let palette_root = match roots.venv() {
+            Some(_) => match crate::palette::menu_relative_root(&group.target_dir)? {
+                Some(base) => Some((PaletteTree::Menus, base)),
+                None => crate::palette::addons_relative_root(&group.target_dir)?
+                    .map(|base| (PaletteTree::Addons, base)),
+            },
+            None => None,
         };
-        if menu_relative_root.is_some() {
+        if palette_root.is_some() {
             crate::palette::validate_package_name(&spec.name)?;
         }
-        let dest_root = match &menu_relative_root {
-            Some(relative) => crate::palette::contribution_root(roots, &spec.name).join(relative),
-            None => roots.expand(&group.target_dir)?,
-        };
         let if_newer = group.replace_mode.eq_ignore_ascii_case("If Newer");
 
         for rel in &group.files {
             let rel_path = safe_relative(rel)?;
-            let palette_relative = menu_relative_root
-                .as_ref()
-                .map(|base| base.join(&rel_path).to_string_lossy().replace('\\', "/"));
+            let palette = palette_root.as_ref().and_then(|(tree, base)| {
+                (*tree == PaletteTree::Menus || crate::palette::is_mnu(&rel_path)).then(|| PaletteFile {
+                    relative: base.join(&rel_path).to_string_lossy().replace('\\', "/"),
+                    tree: *tree,
+                })
+            });
             let entry_name = format!("File Group {}/{}", group.index, rel.replace('\\', "/"));
 
             let Some(&zip_index) = by_lower.get(&entry_name.to_lowercase()) else {
@@ -253,22 +290,20 @@ pub fn plan(roots: &Roots, spec: &Spec, zip: &mut Archive) -> Result<Plan> {
                 continue;
             };
 
-            let dest = dest_root.join(&rel_path);
+            let dest = match &palette {
+                Some(p) => crate::palette::contribution_tree(roots, &spec.name, p.tree).join(&p.relative),
+                None => roots.expand(&group.target_dir)?.join(&rel_path),
+            };
             roots.check_contained(&dest)?;
 
             let exists = dest.exists();
+            palette_files.extend(palette);
             if exists && if_newer {
                 // PoC simplification: `If Newer` only writes when absent.
                 // Doing it properly means comparing the archive timestamp
                 // against the file on disk.
                 kept.push(dest);
-                if let Some(relative) = &palette_relative {
-                    palette_files.push(PaletteFile { relative: relative.clone() });
-                }
                 continue;
-            }
-            if let Some(relative) = &palette_relative {
-                palette_files.push(PaletteFile { relative: relative.clone() });
             }
             writes.push(PlannedWrite { zip_index, dest, overwrites: exists });
         }
@@ -644,7 +679,7 @@ File 0="functions.mnu"
         let plan = plan(&roots, &spec, &mut zip).unwrap();
         let source = crate::palette::contribution_root(&roots, "example").join("Categories/functions.mnu");
         assert_eq!(plan.writes[0].dest, source);
-        assert_eq!(plan.palette_files, [PaletteFile { relative: "Categories/functions.mnu".into() }]);
+        assert_eq!(plan.palette_files, [PaletteFile { relative: "Categories/functions.mnu".into(), tree: PaletteTree::Menus }]);
         let manifest = apply(&roots, &spec, &mut zip, &plan, None, Vec::new()).unwrap();
 
         assert!(source.is_file());
@@ -652,5 +687,59 @@ File 0="functions.mnu"
         assert!(manifest.files.iter().any(|file| PathBuf::from(file) == source));
         assert_eq!(manifest.palette_files, plan.palette_files);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn venv_addons_mnu_files_go_to_the_contribution_store_and_vis_stay_in_the_addon() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("lvpm-addons-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = LvTarget { version: 26.3, bitness: 64, path: dir.join("LabVIEW") };
+        let roots = Roots::project(&dir, &target, "hse_lib_hse_logger");
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for name in ["dir.mnu", "functions_hse_logger.mnu", "Helper.vi"] {
+            writer.start_file(format!("File Group 0/{name}"), zip::write::SimpleFileOptions::default()).unwrap();
+            writer.write_all(name.as_bytes()).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut zip = open_archive(bytes).unwrap();
+        let spec = crate::spec::parse(
+            r#"[Package]
+Name="hse_lib_hse_logger"
+Version="1"
+
+[File Group 0]
+Target Dir="<vi.lib>\addons\HSE"
+Num Files=3
+File 0="dir.mnu"
+File 1="functions_hse_logger.mnu"
+File 2="Helper.vi"
+"#,
+        )
+        .unwrap();
+
+        let plan = plan(&roots, &spec, &mut zip).unwrap();
+        let store = crate::palette::contribution_tree(&roots, "hse_lib_hse_logger", PaletteTree::Addons);
+        assert_eq!(plan.writes[0].dest, store.join("HSE/dir.mnu"));
+        assert_eq!(plan.writes[1].dest, store.join("HSE/functions_hse_logger.mnu"));
+        assert_eq!(plan.writes[2].dest, roots.expand(r"<vi.lib>\addons\HSE").unwrap().join("Helper.vi"));
+        assert_eq!(
+            plan.palette_files,
+            [
+                PaletteFile { relative: "HSE/dir.mnu".into(), tree: PaletteTree::Addons },
+                PaletteFile { relative: "HSE/functions_hse_logger.mnu".into(), tree: PaletteTree::Addons },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_palette_record_from_before_addons_merging_reads_as_menus() {
+        let file: PaletteFile = serde_json::from_str(r#"{"relative":"Categories/a.mnu"}"#).unwrap();
+        assert_eq!(file.tree, PaletteTree::Menus);
+        assert_eq!(serde_json::to_string(&file).unwrap(), r#"{"relative":"Categories/a.mnu"}"#);
+        let addons = PaletteFile { relative: "HSE/a.mnu".into(), tree: PaletteTree::Addons };
+        assert_eq!(serde_json::to_string(&addons).unwrap(), r#"{"relative":"HSE/a.mnu","tree":"vi.lib/addons"}"#);
     }
 }

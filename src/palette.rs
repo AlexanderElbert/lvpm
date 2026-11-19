@@ -7,8 +7,12 @@
 //! package's copy. Differing `dir.mnu` files use the first package in
 //! case-insensitive name order; every other differing same-path file is an
 //! error.
+//!
+//! Two trees are merged: `<menus>` and the `.mnu` files under
+//! `<vi.lib>\addons`. Both have category folders several packages add to, and
+//! LabVIEW shows only one addon's copy of a folder.
 
-use crate::install::{self, Manifest, PaletteFile};
+use crate::install::{self, Manifest, PaletteFile, PaletteTree};
 use crate::target::Roots;
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::{BTreeMap, HashSet};
@@ -21,6 +25,7 @@ pub const ADDON_NAME: &str = "venv-palettes";
 #[derive(Debug)]
 struct Entry {
     package: String,
+    /// Relative to the addon root: `menus/...` or `vi.lib/addons/...`.
     relative: String,
     source: PathBuf,
 }
@@ -29,6 +34,8 @@ struct Entry {
 struct LegacyFile {
     package: String,
     path: PathBuf,
+    tree: PaletteTree,
+    /// Relative to the tree's folder.
     relative: String,
     contribution: PathBuf,
     source: PathBuf,
@@ -83,14 +90,58 @@ fn addon_dir(roots: &Roots) -> Result<PathBuf> {
         .join("1"))
 }
 
-pub fn contribution_root(roots: &Roots, package: &str) -> PathBuf {
+fn contribution_base(roots: &Roots, package: &str) -> PathBuf {
     roots
         .venv()
         .expect("palette contributions only belong to a venv")
         .join("palettes")
         .join("contributions")
         .join(package.to_ascii_lowercase())
-        .join("menus")
+}
+
+/// Where a package's palette files of one tree are kept.
+pub fn contribution_tree(roots: &Roots, package: &str, tree: PaletteTree) -> PathBuf {
+    contribution_base(roots, package).join(tree.dir())
+}
+
+#[cfg(test)]
+pub fn contribution_root(roots: &Roots, package: &str) -> PathBuf {
+    contribution_tree(roots, package, PaletteTree::Menus)
+}
+
+/// Whether a file is a palette menu file.
+pub fn is_mnu(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mnu"))
+}
+
+/// The part below `addons` of a `<vi.lib>\addons\...` Target Dir.
+pub fn addons_relative_root(target_dir: &str) -> Result<Option<PathBuf>> {
+    let Some((token, rest)) = target_dir.split_once('>') else {
+        bail!("malformed Target Dir: {target_dir:?}");
+    };
+    if !token.eq_ignore_ascii_case("<vi.lib") {
+        return Ok(None);
+    }
+    let rest = rest.trim_start_matches(['/', '\\']);
+    let (first, below) = rest.split_once(['/', '\\']).unwrap_or((rest, ""));
+    if !first.eq_ignore_ascii_case("addons") {
+        return Ok(None);
+    }
+    Ok(Some(safe_tree_path(below)?))
+}
+
+/// A relative path within a palette tree; empty is the tree's own folder.
+fn safe_tree_path(relative: &str) -> Result<PathBuf> {
+    let mut path = PathBuf::new();
+    for part in relative.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => bail!("refusing path traversal in palette path: {relative:?}"),
+            p if p.contains(':') => bail!("refusing absolute palette path: {relative:?}"),
+            p => path.push(p),
+        }
+    }
+    Ok(path)
 }
 
 /// The `<menus>` portion of an OGPM file group's target, normalized safely.
@@ -146,25 +197,36 @@ fn recorded_file(manifest: &Manifest, path: &Path) -> bool {
     manifest.files.iter().any(|file| normalized(file) == want)
 }
 
-fn legacy_relative(roots: &Roots, manifest: &Manifest, file: &str) -> Result<Option<String>> {
-    let expected = venv_path(roots)?
+/// A palette file an earlier lvpm left in the package's own addon: anything
+/// under its `menus`, and the `.mnu` files under its `vi.lib/addons`.
+fn legacy_relative(
+    roots: &Roots,
+    manifest: &Manifest,
+    file: &str,
+) -> Result<Option<(PaletteTree, String)>> {
+    let package_root = venv_path(roots)?
         .join("packages")
         .join(&manifest.name)
-        .join("1")
-        .join("menus");
-    let expected = normalized(&path_string(&expected));
+        .join("1");
     let file = file.replace('\\', "/");
     let file_lower = file.to_ascii_lowercase();
-    let Some(tail) = file_lower.strip_prefix(&(expected.clone() + "/")) else {
-        return Ok(None);
-    };
-    let relative = &file[expected.len() + 1..];
-    ensure!(
-        tail.len() == relative.len(),
-        "invalid recorded palette path {file:?}"
-    );
-    let safe = safe_palette_path(relative)?;
-    Ok(Some(path_string(&safe)))
+    for tree in [PaletteTree::Menus, PaletteTree::Addons] {
+        let expected = normalized(&path_string(&package_root.join(tree.dir())));
+        let Some(tail) = file_lower.strip_prefix(&(expected.clone() + "/")) else {
+            continue;
+        };
+        let relative = &file[expected.len() + 1..];
+        ensure!(
+            tail.len() == relative.len(),
+            "invalid recorded palette path {file:?}"
+        );
+        let safe = safe_palette_path(relative)?;
+        if tree == PaletteTree::Addons && !is_mnu(&safe) {
+            return Ok(None);
+        }
+        return Ok(Some((tree, path_string(&safe))));
+    }
+    Ok(None)
 }
 
 fn read_regular_file(path: &Path) -> Result<Vec<u8>> {
@@ -219,21 +281,20 @@ fn validate_addon_tree(
         fs::read_to_string(&info_path)? == install::addon_info(ADDON_NAME, target),
         "palette addon information did not validate"
     );
-    let menu_root = root.join("menus");
     let mut actual = Vec::new();
     walk_files(root, root, &mut actual)?;
     let mut expected = HashSet::from([normalized(&path_string(&info_path))]);
     expected.extend(
         files
             .iter()
-            .map(|file| normalized(&path_string(&menu_root.join(&file.relative)))),
+            .map(|file| normalized(&path_string(&root.join(&file.relative)))),
     );
     ensure!(
         actual.len() == expected.len(),
         "palette addon has an unexpected number of files"
     );
     for file in files {
-        let path = menu_root.join(&file.relative);
+        let path = root.join(&file.relative);
         ensure!(
             read_regular_file(&path)? == file.bytes,
             "palette file did not validate: {}",
@@ -259,12 +320,11 @@ fn collect(roots: &Roots, manifests: &[Manifest]) -> Result<(Vec<Entry>, Vec<Leg
             !manifest.name.eq_ignore_ascii_case(ADDON_NAME),
             "package name {ADDON_NAME:?} is reserved for lvpm's palette addon"
         );
-        let root = contribution_root(roots, &manifest.name);
         let mut recorded_legacy = HashSet::new();
 
         for palette in &manifest.palette_files {
             let relative = path_string(&safe_palette_path(&palette.relative)?);
-            let source = root.join(&relative);
+            let source = contribution_tree(roots, &manifest.name, palette.tree).join(&relative);
             ensure!(
                 recorded_file(manifest, &source),
                 "{}'s palette record does not own {}",
@@ -273,19 +333,19 @@ fn collect(roots: &Roots, manifests: &[Manifest]) -> Result<(Vec<Entry>, Vec<Leg
             );
             entries.push(Entry {
                 package: manifest.name.clone(),
-                relative,
+                relative: format!("{}/{relative}", palette.tree.dir()),
                 source,
             });
         }
 
         for file in &manifest.files {
-            let Some(relative) = legacy_relative(roots, manifest, file)? else {
+            let Some((tree, relative)) = legacy_relative(roots, manifest, file)? else {
                 continue;
             };
             recorded_legacy.insert(normalized(file));
             let old = PathBuf::from(file);
-            let contribution = root.join(&relative);
-            let mounted = addon_dir(roots)?.join("menus").join(&relative);
+            let contribution = contribution_tree(roots, &manifest.name, tree).join(&relative);
+            let mounted = addon_dir(roots)?.join(tree.dir()).join(&relative);
             let source = if contribution.is_file() {
                 if old.is_file() {
                     ensure!(
@@ -310,12 +370,13 @@ fn collect(roots: &Roots, manifests: &[Manifest]) -> Result<(Vec<Entry>, Vec<Leg
             };
             entries.push(Entry {
                 package: manifest.name.clone(),
-                relative: relative.clone(),
+                relative: format!("{}/{relative}", tree.dir()),
                 source: source.clone(),
             });
             legacy.push(LegacyFile {
                 package: manifest.name.clone(),
                 path: old,
+                tree,
                 relative,
                 contribution,
                 source,
@@ -354,7 +415,7 @@ fn manifests_for_reconcile(roots: &Roots) -> Result<(Vec<Manifest>, bool)> {
             .join(&package)
             .join("1")
             .join("menus");
-        let contribution = contribution_root(roots, &package);
+        let contribution = contribution_base(roots, &package);
         let mut files = Vec::new();
         walk_files(&old_root, &old_root, &mut files)?;
         walk_files(&contribution, &contribution, &mut files)?;
@@ -515,7 +576,7 @@ fn publish(roots: &Roots, files: &[MergedFile], target: &crate::target::LvTarget
     )
     .with_context(|| format!("writing palette addon information in {}", stage.display()))?;
     for file in files {
-        let destination = stage.join("menus").join(&file.relative);
+        let destination = stage.join(&file.relative);
         fs::create_dir_all(destination.parent().context("palette file has no parent")?)?;
         fs::write(&destination, &file.bytes)
             .with_context(|| format!("staging palette file {}", destination.display()))?;
@@ -653,6 +714,7 @@ fn record_migration(
         for file in &files {
             let palette = PaletteFile {
                 relative: file.relative.clone(),
+                tree: file.tree,
             };
             if !manifest.palette_files.contains(&palette) {
                 manifest.palette_files.push(palette);
@@ -716,15 +778,17 @@ fn prune_legacy_dirs(roots: &Roots, path: &Path) -> Result<()> {
 fn cleanup_orphans(roots: &Roots, manifests: &[Manifest]) -> Result<()> {
     let mut referenced = HashSet::new();
     for manifest in manifests {
-        let root = contribution_root(roots, &manifest.name);
         for palette in &manifest.palette_files {
             referenced.insert(normalized(&path_string(
-                &root.join(safe_palette_path(&palette.relative)?),
+                &contribution_tree(roots, &manifest.name, palette.tree)
+                    .join(safe_palette_path(&palette.relative)?),
             )));
         }
         for file in &manifest.files {
-            if let Some(relative) = legacy_relative(roots, manifest, file)? {
-                referenced.insert(normalized(&path_string(&root.join(relative))));
+            if let Some((tree, relative)) = legacy_relative(roots, manifest, file)? {
+                referenced.insert(normalized(&path_string(
+                    &contribution_tree(roots, &manifest.name, tree).join(relative),
+                )));
             }
         }
     }
@@ -863,14 +927,18 @@ mod tests {
             post_uninstall_vi: None,
             skipped_groups: Vec::new(),
         };
-        let source_root = contribution_root(roots, name);
         for (relative, bytes) in files {
+            // `vi.lib/addons/...` is the Addons tree; anything else is `menus`.
+            let (tree, relative) = match relative.strip_prefix("vi.lib/addons/") {
+                Some(rest) => (PaletteTree::Addons, rest),
+                None => (PaletteTree::Menus, *relative),
+            };
             let relative = path_string(&safe_palette_path(relative).unwrap());
-            let source = source_root.join(&relative);
+            let source = contribution_tree(roots, name, tree).join(&relative);
             fs::create_dir_all(source.parent().unwrap()).unwrap();
             fs::write(&source, bytes).unwrap();
             manifest.files.push(path_string(&source));
-            manifest.palette_files.push(PaletteFile { relative });
+            manifest.palette_files.push(PaletteFile { relative, tree });
         }
         install::write_manifest(roots, &manifest).unwrap();
     }
@@ -908,6 +976,117 @@ mod tests {
             ADDON_NAME
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn packages_sharing_an_addons_category_all_show_in_it() {
+        // The HSE packages: each ships the same `addons\HSE\dir.mnu` and its
+        // own palette beside it. Merged, the category lists every one.
+        let (dir, roots) = roots("addons");
+        add_package(
+            &roots,
+            "hse_lib_hse_logger",
+            &[
+                ("vi.lib/addons/HSE/dir.mnu", b"hse"),
+                ("vi.lib/addons/HSE/functions_hse_lib_hse_logger.mnu", b"logger"),
+            ],
+        );
+        add_package(
+            &roots,
+            "hse_lib_hse_layout_manager",
+            &[
+                ("vi.lib/addons/HSE/dir.mnu", b"hse"),
+                ("vi.lib/addons/HSE/functions_HSE_lib_hse_layout_manager.mnu", b"layout"),
+            ],
+        );
+        add_package(&roots, "hse_lib_hse_framework", &[("Controls/controls_hse.mnu", b"controls")]);
+
+        assert!(reconcile(&roots).unwrap());
+        verify(&roots).unwrap();
+        let addon = addon_dir(&roots).unwrap();
+        let hse = addon.join("vi.lib/addons/HSE");
+        assert_eq!(fs::read(hse.join("dir.mnu")).unwrap(), b"hse");
+        assert_eq!(fs::read(hse.join("functions_hse_lib_hse_logger.mnu")).unwrap(), b"logger");
+        assert_eq!(
+            fs::read(hse.join("functions_HSE_lib_hse_layout_manager.mnu")).unwrap(),
+            b"layout"
+        );
+        assert_eq!(fs::read(addon.join("menus/Controls/controls_hse.mnu")).unwrap(), b"controls");
+
+        install::uninstall(&roots, "hse_lib_hse_logger").unwrap();
+        assert!(reconcile(&roots).unwrap());
+        assert!(!hse.join("functions_hse_lib_hse_logger.mnu").exists());
+        assert_eq!(fs::read(hse.join("dir.mnu")).unwrap(), b"hse");
+        verify(&roots).unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migrates_addons_mnu_files_from_the_package_and_leaves_its_vis() {
+        let (dir, roots) = roots("addons-migration");
+        let package = roots.venv().unwrap().join("packages/hse_lib_hse_logger/1/vi.lib/addons/HSE");
+        fs::create_dir_all(&package).unwrap();
+        let menu = package.join("functions_hse_lib_hse_logger.mnu");
+        let vi = package.join("Helper.vi");
+        fs::write(&menu, b"logger").unwrap();
+        fs::write(&vi, b"vi").unwrap();
+        let manifest = Manifest {
+            name: "hse_lib_hse_logger".into(),
+            version: "1".into(),
+            display_name: None,
+            installed_at: 0,
+            target: "test".into(),
+            files: vec![path_string(&menu), path_string(&vi)],
+            palette_files: Vec::new(),
+            dependencies: Vec::new(),
+            skipped_hooks: Vec::new(),
+            relinked: false,
+            relink_folders: Vec::new(),
+            post_install_vi: None,
+            post_install: None,
+            pre_install_vi: None,
+            pre_uninstall_vi: None,
+            post_uninstall_vi: None,
+            skipped_groups: Vec::new(),
+        };
+        install::write_manifest(&roots, &manifest).unwrap();
+
+        assert!(reconcile(&roots).unwrap());
+        verify(&roots).unwrap();
+        let migrated = contribution_tree(&roots, "hse_lib_hse_logger", PaletteTree::Addons)
+            .join("HSE/functions_hse_lib_hse_logger.mnu");
+        assert_eq!(fs::read(&migrated).unwrap(), b"logger");
+        assert!(!menu.exists());
+        assert!(vi.is_file());
+        assert_eq!(
+            fs::read(addon_dir(&roots).unwrap().join("vi.lib/addons/HSE/functions_hse_lib_hse_logger.mnu"))
+                .unwrap(),
+            b"logger"
+        );
+        let updated = install::read_manifest(&roots, "hse_lib_hse_logger").unwrap();
+        assert_eq!(
+            updated.palette_files,
+            [PaletteFile {
+                relative: "HSE/functions_hse_lib_hse_logger.mnu".into(),
+                tree: PaletteTree::Addons,
+            }]
+        );
+        assert!(recorded_file(&updated, &migrated));
+        assert!(recorded_file(&updated, &vi));
+        assert!(!recorded_file(&updated, &menu));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn addons_target_paths() {
+        assert_eq!(
+            addons_relative_root(r"<vi.lib>\addons\HSE").unwrap(),
+            Some(PathBuf::from("HSE"))
+        );
+        assert_eq!(addons_relative_root(r"<vi.lib>\Addons").unwrap(), Some(PathBuf::new()));
+        assert_eq!(addons_relative_root(r"<vi.lib>\HSE\addons").unwrap(), None);
+        assert_eq!(addons_relative_root(r"<userlib>\addons").unwrap(), None);
+        assert!(addons_relative_root(r"<vi.lib>\addons\..\..\x").is_err());
     }
 
     #[test]
@@ -952,7 +1131,7 @@ mod tests {
         assert_eq!(
             choices,
             [DirMnuChoice {
-                relative: "Categories/Shared/dir.mnu".into(),
+                relative: "menus/Categories/Shared/dir.mnu".into(),
                 kept: "alpha".into(),
                 dropped: vec!["zeta".into()],
             }]
@@ -1054,7 +1233,8 @@ mod tests {
         assert_eq!(
             updated.palette_files,
             [PaletteFile {
-                relative: "Categories/Old.mnu".into()
+                relative: "Categories/Old.mnu".into(),
+                tree: PaletteTree::Menus,
             }]
         );
         assert!(recorded_file(&updated, &migrated));
