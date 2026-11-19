@@ -732,9 +732,9 @@ impl HookPolicy {
     fn why_not(&self, pkg: &str) -> &'static str {
         match (self.mode, self.setting(pkg)) {
             (HookMode::Never, _) => "--no-hooks",
-            (_, Some(project::Hooks::Skip)) => "hooks = \"skip\" in the manifest",
-            _ if self.venv => "a venv runs a package's hooks only with hooks = \"run\" in the manifest",
-            _ => "LabVIEW runs headless here (LV_RTE_HEADLESS); hooks = \"run\" or --hooks runs them",
+            (_, Some(project::Hooks::Skip)) => "hooks = \"skip\" in lvpm.toml",
+            _ if self.venv => "a venv runs a package's hooks only when lvpm.toml lists it as <pkg> = { version = \"…\", hooks = \"run\" }, or with --hooks",
+            _ => "LabVIEW runs headless here (LV_RTE_HEADLESS); <pkg> = { version = \"…\", hooks = \"run\" } in lvpm.toml or --hooks runs them",
         }
     }
 }

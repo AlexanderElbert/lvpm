@@ -570,7 +570,7 @@ fn hooks_and_machine_locations_stay_out_of_a_venv() {
     lab.ok(&["venv", "create"]);
 
     let installed = lab.ok(&["install", "tool"]);
-    has(&installed, "1 post-install hook(s) not run (a venv runs a package's hooks only with hooks = \"run\" in the manifest); `lvpm list` shows which");
+    has(&installed, "1 post-install hook(s) not run (a venv runs a package's hooks only when lvpm.toml lists it as <pkg> = { version = \"…\", hooks = \"run\" }, or with --hooks); `lvpm list` shows which");
     has(&installed, "skipped — a venv holds LabVIEW-tree content only");
     assert!(lab.file("tool", "tool.txt").is_file());
     has(&lab.ok(&["list"]), "post-install skipped");
