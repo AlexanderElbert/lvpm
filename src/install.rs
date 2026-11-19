@@ -482,8 +482,10 @@ pub fn uninstall(roots: &Roots, name: &str) -> Result<(usize, Manifest)> {
         }
         let mut d = p.parent().map(Path::to_path_buf);
         while let Some(dir) = d {
-            // Never prune the LabVIEW install dir itself or anything above it.
-            if dir == stop_at || dir.parent().is_none() {
+            // Never prune the LabVIEW install dir itself or anything above it,
+            // nor the venv: palette contributions live outside the package's
+            // addon, so `stop_at` is not among their ancestors.
+            if dir == stop_at || Some(dir.as_path()) == roots.venv() || dir.parent().is_none() {
                 break;
             }
             dirs.push(dir.clone());

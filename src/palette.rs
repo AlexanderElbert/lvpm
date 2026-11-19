@@ -367,7 +367,16 @@ fn manifests_for_reconcile(roots: &Roots) -> Result<(Vec<Manifest>, bool)> {
     Ok((manifests, !unreadable.is_empty()))
 }
 
-fn merge(entries: &[Entry]) -> Result<Vec<MergedFile>> {
+/// A `dir.mnu` that differed between contributors: whose copy was published
+/// and whose were left out.
+#[derive(Debug, PartialEq, Eq)]
+struct DirMnuChoice {
+    relative: String,
+    kept: String,
+    dropped: Vec<String>,
+}
+
+fn merge(entries: &[Entry]) -> Result<(Vec<MergedFile>, Vec<DirMnuChoice>)> {
     let mut ordered: Vec<&Entry> = entries.iter().collect();
     ordered.sort_by(|a, b| {
         a.package
@@ -379,6 +388,7 @@ fn merge(entries: &[Entry]) -> Result<Vec<MergedFile>> {
     });
 
     let mut files: BTreeMap<String, MergedFile> = BTreeMap::new();
+    let mut choices: BTreeMap<String, DirMnuChoice> = BTreeMap::new();
     for entry in ordered {
         let relative = path_string(&safe_palette_path(&entry.relative)?);
         let key = normalized(&relative);
@@ -393,10 +403,21 @@ fn merge(entries: &[Entry]) -> Result<Vec<MergedFile>> {
                 .is_some_and(|name| name.eq_ignore_ascii_case("dir.mnu"))
                 && !existing.package.eq_ignore_ascii_case(&entry.package)
             {
+                choices
+                    .entry(key)
+                    .or_insert_with(|| DirMnuChoice {
+                        relative: existing.relative.clone(),
+                        kept: existing.package.clone(),
+                        dropped: Vec::new(),
+                    })
+                    .dropped
+                    .push(entry.package.clone());
                 continue;
             }
             bail!(
-                "palette conflict at {relative:?}: packages {} and {} provide different files",
+                "palette conflict at {relative:?}: packages {} and {} provide different files; \
+                 the published palettes are unchanged. Uninstall one of the two, or report the \
+                 clash to their maintainers",
                 existing.package,
                 entry.package
             );
@@ -410,7 +431,12 @@ fn merge(entries: &[Entry]) -> Result<Vec<MergedFile>> {
             },
         );
     }
-    Ok(files.into_values().collect())
+    Ok((files.into_values().collect(), choices.into_values().collect()))
+}
+
+/// Whether the published addon already holds exactly `files`.
+fn is_current(roots: &Roots, files: &[MergedFile], target: &crate::target::LvTarget) -> Result<bool> {
+    Ok(managed_marker(roots)?.exists() && validate_addon_tree(&addon_dir(roots)?, files, target).is_ok())
 }
 
 fn recover(roots: &Roots) -> Result<()> {
@@ -537,7 +563,8 @@ fn publish(roots: &Roots, files: &[MergedFile], target: &crate::target::LvTarget
     Ok(())
 }
 
-fn publish_empty(roots: &Roots) -> Result<()> {
+/// Remove the managed addon; whether there was a published one to remove.
+fn publish_empty(roots: &Roots) -> Result<bool> {
     recover(roots)?;
     let marker = managed_marker(roots)?;
     if !marker.exists() {
@@ -548,11 +575,12 @@ fn publish_empty(roots: &Roots) -> Result<()> {
             "reserved palette addon path already exists and is not managed by lvpm: {}",
             addon_parent.display()
         );
-        return Ok(());
+        return Ok(false);
     }
     let output = addon_dir(roots)?;
     let backup = backup_dir(roots)?;
-    if output.exists() {
+    let had_output = output.exists();
+    if had_output {
         fs::rename(&output, &backup).with_context(|| {
             format!(
                 "staging the previous palette addon from {}",
@@ -579,7 +607,7 @@ fn publish_empty(roots: &Roots) -> Result<()> {
     if parent.exists() && fs::read_dir(parent)?.next().is_none() {
         fs::remove_dir(parent)?;
     }
-    Ok(())
+    Ok(had_output)
 }
 
 fn copy_legacy(legacy: &[LegacyFile]) -> Result<()> {
@@ -715,28 +743,48 @@ fn cleanup_orphans(roots: &Roots, manifests: &[Manifest]) -> Result<()> {
 /// Migrate package-local menus if needed and atomically rebuild the reserved
 /// addon. A conflict or failed stage leaves the currently published tree in
 /// place; file ownership remains with the package manifests.
-pub fn reconcile(roots: &Roots) -> Result<()> {
+///
+/// An addon that already holds the merged tree is left alone, so a reconcile
+/// with nothing to do never renames a folder a running LabVIEW has mounted.
+/// Returns whether the published palettes changed.
+pub fn reconcile(roots: &Roots) -> Result<bool> {
     if roots.venv().is_none() {
-        return Ok(());
+        return Ok(false);
     }
     recover(roots)?;
     let (mut manifests, has_unreadable) = manifests_for_reconcile(roots)?;
     let (entries, legacy) = collect(roots, &manifests)?;
-    let merged = merge(&entries)?;
+    let (merged, choices) = merge(&entries)?;
 
     copy_legacy(&legacy)?;
-    match (&merged[..], roots.target.as_ref()) {
+    let changed = match (&merged[..], roots.target.as_ref()) {
         ([], _) => publish_empty(roots)?,
-        (_, Some(target)) => publish(roots, &merged, target)?,
+        (_, Some(target)) if is_current(roots, &merged, target)? => false,
+        (_, Some(target)) => {
+            publish(roots, &merged, target)?;
+            true
+        }
         (_, None) => bail!("palette addon cannot be created without a bound LabVIEW target"),
-    }
+    };
     record_migration(roots, &mut manifests, &legacy)?;
+
+    // Said when the tree is (re)built, not on every reconcile that finds it current.
+    if changed {
+        for choice in &choices {
+            wlog!(
+                "palettes: packages ship different {}; using {}'s, not {}'s",
+                choice.relative,
+                choice.kept,
+                choice.dropped.join("'s, ")
+            );
+        }
+    }
 
     if !has_unreadable {
         let updated = install::list_installed(roots)?;
         cleanup_orphans(roots, &updated)?;
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// Verify that the merged addon matches recorded package contributions.
@@ -750,7 +798,7 @@ pub fn verify(roots: &Roots) -> Result<()> {
         legacy.is_empty(),
         "package-local palette files need migration; run `lvpm install`"
     );
-    let merged = merge(&entries)?;
+    let (merged, _) = merge(&entries)?;
     let output = addon_dir(roots)?;
     let marker = managed_marker(roots)?;
     if merged.is_empty() {
@@ -896,6 +944,38 @@ mod tests {
         let menus = addon_dir(&roots).unwrap().join("menus/Categories/Shared");
         assert_eq!(fs::read(menus.join("dir.mnu")).unwrap(), b"alpha");
         assert_eq!(fs::read(menus.join("same.mnu")).unwrap(), b"same");
+        verify(&roots).unwrap();
+
+        let manifests = install::list_installed(&roots).unwrap();
+        let (entries, _) = collect(&roots, &manifests).unwrap();
+        let (_, choices) = merge(&entries).unwrap();
+        assert_eq!(
+            choices,
+            [DirMnuChoice {
+                relative: "Categories/Shared/dir.mnu".into(),
+                kept: "alpha".into(),
+                dropped: vec!["zeta".into()],
+            }]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_current_addon_is_not_republished() {
+        let (dir, roots) = roots("current");
+        add_package(&roots, "alpha", &[("Categories/Shared/a.mnu", b"a")]);
+        assert!(reconcile(&roots).unwrap());
+
+        // Publishing renames the addon folder away and back; a reconcile with
+        // nothing to do must not, or it fights a LabVIEW that has it mounted.
+        let addon = addon_dir(&roots).unwrap();
+        let held = addon.join("menus/Categories/Shared/a.mnu");
+        let before = fs::metadata(&held).unwrap().modified().unwrap();
+        assert!(!reconcile(&roots).unwrap());
+        assert_eq!(fs::metadata(&held).unwrap().modified().unwrap(), before);
+
+        add_package(&roots, "beta", &[("Categories/Shared/b.mnu", b"b")]);
+        assert!(reconcile(&roots).unwrap());
         verify(&roots).unwrap();
         let _ = fs::remove_dir_all(dir);
     }

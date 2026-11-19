@@ -182,8 +182,15 @@ paths one addon provider while keeping each package's contribution available
 for upgrades, verification and uninstall. Byte-identical files are
 deduplicated. When contributors provide different `dir.mnu` files at the same
 path, the first package in case-insensitive package-name order supplies that
-file; different non-`dir.mnu` files at one path fail reconciliation and leave
-the previously published tree untouched. `lvpm install` migrates existing
+file, and the install warns which copy it kept and which it left out.
+Different non-`dir.mnu` files at one path fail reconciliation and leave the
+previously published tree untouched; the error names both packages. A
+conflict already in the venv does not block the next install, which may be
+the one that resolves it: only the reconcile after the install fails.
+An addon that already matches is not rewritten, so an install with no palette
+changes never touches the folder a running LabVIEW has mounted. A running
+venv LabVIEW reads palettes at startup; after a change lvpm says to restart
+it. `lvpm install` migrates existing
 package-local menu files automatically. It does not change package archives
 or the global LabVIEW installation. lvpm preserves the menu tree's relative
 paths but does not parse opaque `.mnu` contents: absolute references, paths

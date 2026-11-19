@@ -1415,6 +1415,14 @@ fn cmd_refresh(cli: &Cli, timeout: u64) -> Result<()> {
     Ok(())
 }
 
+/// A venv LabVIEW reads its palettes at startup: one already running does not
+/// show a rebuilt `venv-palettes` addon until it is restarted.
+fn note_palette_change(dest: &Destination, changed: bool) {
+    if changed && let Destination::Venv(v) = dest && launch::is_running(v) {
+        log!("palettes: changed; restart the venv's LabVIEW to see them");
+    }
+}
+
 fn cmd_uninstall(
     cli: &Cli, package: Option<&str>, all: bool, with_deps: bool, keep_deps: bool, no_save: bool, force: bool,
 ) -> Result<()> {
@@ -1553,7 +1561,9 @@ fn cmd_uninstall(
     unsave_now();
 
     if uninstalled_any && roots.venv().is_some() {
-        palette::reconcile(&roots).context("packages were removed, but venv palettes could not be reconciled")?;
+        let changed = palette::reconcile(&roots)
+            .context("packages were removed, but venv palettes could not be reconciled")?;
+        note_palette_change(&dest, changed);
     }
 
     // The same reason as on install, in reverse: the packages' `.mnu` files
@@ -1973,8 +1983,14 @@ fn cmd_install(
     let mut relink_work: Vec<(String, Vec<PathBuf>)> = Vec::new();
     let mut linkfix_files = Vec::new();
 
-    if !dry_run && venv.is_some() {
-        palette::reconcile(&store).context("migrating and reconciling existing venv palettes")?;
+    // Migrates package-local menus before anything is uninstalled or upgraded.
+    // Not fatal: a conflict already in the venv must not block the install
+    // that resolves it, and the reconcile after the install is the one that
+    // counts — it fails on whatever is still wrong then.
+    if !dry_run && venv.is_some()
+        && let Err(e) = palette::reconcile(&store)
+    {
+        wlog!("palettes: {e:#}; retrying after the install");
     }
 
     for e in &plan {
@@ -2117,7 +2133,8 @@ fn cmd_install(
         }
     }
     if !dry_run && venv.is_some() {
-        palette::reconcile(&store).context("reconciling venv palettes after install")?;
+        let changed = palette::reconcile(&store).context("reconciling venv palettes after install")?;
+        note_palette_change(&dest, changed);
     }
     if hooks_unrun && hook_mode == HookMode::Default {
         log!(
