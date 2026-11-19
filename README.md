@@ -8,6 +8,7 @@
 <p align="center">
   <a href="https://github.com/labview-package-manager/lvpm/actions/workflows/build.yml"><img alt="build" src="https://github.com/labview-package-manager/lvpm/actions/workflows/build.yml/badge.svg"></a>
   <a href="https://github.com/labview-package-manager/lvpm/releases"><img alt="release" src="https://img.shields.io/github/v/release/labview-package-manager/lvpm?include_prereleases&sort=semver"></a>
+  <a href="https://github.com/labview-package-manager/lvpm/releases"><img alt="downloads" src="https://img.shields.io/github/downloads/labview-package-manager/lvpm/total"></a>
   <a href="#license"><img alt="license: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue"></a>
 </p>
 
