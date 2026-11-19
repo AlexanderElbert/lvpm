@@ -96,6 +96,27 @@ front (`start`) or turns this off (`off`) — for instance for a tool that finds
 LabVIEW's windows by their exact title. A LabVIEW on the venv started some
 other way than `lvpm launch` is not tagged.
 
+### The venv's icon and taskbar button
+
+The same watcher gives the venv LabVIEW's windows an icon and a taskbar
+button of their own. The icon is the bound LabVIEW's icon with a coloured disc
+in the upper right, carrying the project's initial from 32 px up. The colour
+comes from the project folder's name, so two venvs differ and each keeps its
+colour. lvpm writes it to `.lv-venv\venv.ico` at each launch and for
+`venv shortcut`. It shows in the title bars, on the taskbar and in Alt+Tab.
+
+LabVIEW groups all its windows under one taskbar button per LabVIEW
+version. The watcher gives each venv's windows an app id of their own
+(`lvpm.venv.<hash of the project path>`), so a venv's LabVIEW gets its own
+button, separate from your normal LabVIEW and from other venvs. Right-click
+that button and choose *Pin to taskbar*: the pin shows the venv's icon and
+name, and clicking it runs `lvpm --project <repo> launch`. The pin records the
+full path of the `lvpm.exe` that launched the venv, so pin it again if you
+move lvpm.
+
+The properties lvpm sets on LabVIEW's windows go away when that LabVIEW
+exits.
+
 ## Layout
 
 ```text

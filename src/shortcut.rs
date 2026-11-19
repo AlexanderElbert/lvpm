@@ -35,6 +35,27 @@ pub fn arguments(v: &Venv, lvproj: Option<&Path>) -> String {
     args
 }
 
+/// The Windows app id a venv's LabVIEW windows carry, so the taskbar groups
+/// them apart from the user's own LabVIEW and pins relaunch the venv. Stable
+/// for a repo path across lvpm versions, or a pinned button stops matching.
+pub fn app_id(v: &Venv) -> String {
+    let key = v.repo.to_string_lossy().to_lowercase().replace('/', "\\");
+    format!("lvpm.venv.{:016x}", crate::venv_icon::fnv1a(key.trim_end_matches('\\')))
+}
+
+/// The full command line that starts this venv's LabVIEW again: what a
+/// taskbar pin runs.
+pub fn relaunch_command(v: &Venv) -> Result<String> {
+    let lvpm = std::env::current_exe().context("locating lvpm.exe")?;
+    Ok(format!("{} {}", quote(&lvpm), arguments(v, None)))
+}
+
+/// What the taskbar calls a pinned venv: `<project> (LabVIEW 2026)`.
+pub fn display_name(v: &Venv) -> String {
+    let name = v.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "venv".into());
+    format!("{name} (LabVIEW {})", v.target.year())
+}
+
 /// A path as one Windows command-line argument. Windows paths cannot hold
 /// `"`, so quoting is enough — but a trailing backslash would escape the
 /// closing quote, and is dropped.
@@ -54,7 +75,15 @@ pub fn create(v: &Venv, lvproj: Option<&Path>, lnk: &Path) -> Result<()> {
     sl.set_relative_path(None);
     sl.set_arguments(Some(arguments(v, lvproj)));
     sl.set_working_dir(Some(v.repo.to_string_lossy().into_owned()));
-    sl.set_icon_location(Some(v.target.exe().to_string_lossy().into_owned()));
+    // The venv's badged icon; LabVIEW's own if it could not be made.
+    let icon = match crate::venv_icon::write(v) {
+        Ok(ico) => ico,
+        Err(e) => {
+            wlog!("warning: shortcut gets LabVIEW's plain icon: {e:#}");
+            v.target.exe()
+        }
+    };
+    sl.set_icon_location(Some(icon.to_string_lossy().into_owned()));
     sl.set_name(Some(format!("{} on the venv in {}", v.target.label(), v.repo.display())));
     sl.header_mut().set_show_command(ShowCommand::ShowNormal);
     sl.create_lnk(lnk).with_context(|| format!("writing {}", lnk.display()))?;

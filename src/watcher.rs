@@ -75,18 +75,35 @@ fn untagged(title: &str, tag: &str) -> String {
     if t == tag { String::new() } else { t }
 }
 
+/// What the taskbar gets told about each window: an app id of the venv's own,
+/// so its windows group apart from the user's LabVIEW, and how to start it
+/// again, which is what pinning that group records.
+///
+/// Measured on LabVIEW 2026: LabVIEW sets no app id on its windows, so the
+/// taskbar groups them by exe path — every LabVIEW 2026, venv or not, in one
+/// button. A window's own app id overrides that, and changing it on a shown
+/// window moves the window to its new group.
+#[cfg(windows)]
+pub struct Taskbar {
+    pub id: String,
+    pub relaunch: String,
+    pub icon: String,
+    pub name: String,
+}
+
 /// Tag the windows of the LabVIEW with process id `pid` until it exits.
 #[cfg(windows)]
-pub fn watch(pid: u32, tag: &str, pos: TitlePosition) -> anyhow::Result<()> {
-    win::watch(pid, tag, pos)
+pub fn watch(pid: u32, tag: &str, pos: TitlePosition, taskbar: Option<Taskbar>) -> anyhow::Result<()> {
+    win::watch(pid, tag, pos, taskbar)
 }
 
 #[cfg(windows)]
 mod win {
-    use super::retitle;
+    use super::{Taskbar, retitle};
     use crate::config::TitlePosition;
     use anyhow::{Result, bail};
     use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
     use std::ffi::c_void;
 
     type Hwnd = *mut c_void;
@@ -123,6 +140,9 @@ mod win {
         fn PeekMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: u32) -> i32;
         fn TranslateMessage(msg: *const Msg) -> i32;
         fn DispatchMessageW(msg: *const Msg) -> isize;
+        fn LoadImageW(instance: Handle, name: *const u16, kind: u32, cx: i32, cy: i32, flags: u32) -> Handle;
+        fn GetDpiForWindow(hwnd: Hwnd) -> u32;
+        fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32;
     }
 
     unsafe extern "system" {
@@ -138,6 +158,14 @@ mod win {
     const GWL_EXSTYLE: i32 = -20;
     const WS_EX_APPWINDOW: u32 = 0x0004_0000;
     const WM_SETTEXT: u32 = 0x000C;
+    const WM_GETICON: u32 = 0x007F;
+    const WM_SETICON: u32 = 0x0080;
+    const ICON_SMALL: usize = 0;
+    const ICON_BIG: usize = 1;
+    const SM_CXICON: i32 = 11;
+    const SM_CXSMICON: i32 = 49;
+    const IMAGE_ICON: u32 = 1;
+    const LR_LOADFROMFILE: u32 = 0x10;
     const SMTO_ABORTIFHUNG: u32 = 0x0002;
     const SET_TIMEOUT_MS: u32 = 500;
     const SYNCHRONIZE: u32 = 0x0010_0000;
@@ -154,18 +182,83 @@ mod win {
         pid: u32,
         tag: String,
         pos: TitlePosition,
+        taskbar: Option<Taskbar>,
+        /// Windows that already carry the taskbar properties: set once each,
+        /// not on every title change. A cell of its own, borrowed only
+        /// briefly: a cross-process send can let the next event in before it
+        /// returns, and the state must stay shareable across that.
+        grouped: RefCell<HashSet<usize>>,
+        /// The venv's icon for the windows' title bars, taskbar buttons and
+        /// Alt+Tab.
+        icons: Option<Icons>,
+    }
+
+    /// The venv's `.ico`, loaded at each size a window asks for and kept for
+    /// the watcher's life. Icon handles are valid in every process of the
+    /// session, so LabVIEW's windows can show ours — for as long as this
+    /// process lives, which is as long as that LabVIEW does.
+    struct Icons {
+        file: Vec<u16>,
+        loaded: RefCell<HashMap<i32, Handle>>,
+    }
+
+    impl Icons {
+        fn new(path: &str) -> Icons {
+            Icons { file: path.encode_utf16().chain(std::iter::once(0)).collect(), loaded: RefCell::new(HashMap::new()) }
+        }
+
+        fn at(&self, size: i32) -> Handle {
+            *self.loaded.borrow_mut().entry(size).or_insert_with(|| {
+                // SAFETY: a NUL-terminated path; a null result just means no icon.
+                unsafe { LoadImageW(std::ptr::null_mut(), self.file.as_ptr(), IMAGE_ICON, size, size, LR_LOADFROMFILE) }
+            })
+        }
+
+        /// Give `hwnd` the venv's small and big icon at its DPI, unless it has
+        /// them already: LabVIEW may put its own back, and this runs on every
+        /// title change, which is when it would.
+        fn apply(&self, hwnd: Hwnd) {
+            // SAFETY: no pointers.
+            let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+            for (which, metric) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
+                // SAFETY: no pointers.
+                let size = unsafe { GetSystemMetricsForDpi(metric, dpi) };
+                let icon = self.at(size);
+                if icon.is_null() {
+                    continue;
+                }
+                let mut current = 0usize;
+                // SAFETY: `current` is a valid usize; the call returns before
+                // its timeout ends.
+                let asked = unsafe { SendMessageTimeoutW(hwnd, WM_GETICON, which, 0, SMTO_ABORTIFHUNG, SET_TIMEOUT_MS, &mut current) };
+                if asked != 0 && current == icon as usize {
+                    continue;
+                }
+                let mut ignored = 0usize;
+                // SAFETY: as above; the icon handle outlives the window's use
+                // of it (see the type's comment).
+                unsafe { SendMessageTimeoutW(hwnd, WM_SETICON, which, icon as isize, SMTO_ABORTIFHUNG, SET_TIMEOUT_MS, &mut ignored) };
+            }
+        }
     }
 
     thread_local! {
         static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     }
 
-    pub fn watch(pid: u32, tag: &str, pos: TitlePosition) -> Result<()> {
-        if pos == TitlePosition::Off {
+    pub fn watch(pid: u32, tag: &str, pos: TitlePosition, taskbar: Option<Taskbar>) -> Result<()> {
+        if pos == TitlePosition::Off && taskbar.is_none() {
             return Ok(());
         }
         let Some(process) = Process::open(pid) else { bail!("no process {pid} to watch") };
-        STATE.with(|s| *s.borrow_mut() = Some(State { pid, tag: tag.to_string(), pos }));
+        if let Some(t) = &taskbar {
+            log::debug!("app id {} for LabVIEW {pid}", t.id);
+            taskbar::init();
+        }
+        let icons = taskbar.as_ref().filter(|t| t.icon.to_ascii_lowercase().ends_with(".ico")).map(|t| Icons::new(&t.icon));
+        STATE.with(|s| {
+            *s.borrow_mut() = Some(State { pid, tag: tag.to_string(), pos, taskbar, grouped: RefCell::new(HashSet::new()), icons })
+        });
         let (Some(_shown), Some(_renamed)) = (EventHook::new(EVENT_OBJECT_SHOW, pid), EventHook::new(EVENT_OBJECT_NAMECHANGE, pid))
         else {
             bail!("could not hook window events of process {pid}");
@@ -266,6 +359,15 @@ mod win {
             if !(class == "LVFrame" || (class == "LVDChild" && app)) {
                 return;
             }
+            if let Some(t) = &state.taskbar
+                && state.grouped.borrow_mut().insert(hwnd as usize)
+                && let Err(e) = taskbar::apply(hwnd, t)
+            {
+                log::debug!("taskbar properties not set on {hwnd:?}: {e}");
+            }
+            if let Some(icons) = state.icons.as_ref() {
+                icons.apply(hwnd);
+            }
             let title = window_text(hwnd);
             let Some(want) = retitle(&title, &state.tag, state.pos) else { return };
             if !set_window_text(hwnd, &want) {
@@ -325,6 +427,122 @@ mod win {
             SendMessageTimeoutW(hwnd, WM_SETTEXT, 0, wide.as_ptr() as isize, SMTO_ABORTIFHUNG, SET_TIMEOUT_MS, &mut result)
         };
         ok != 0
+    }
+
+    /// The taskbar's per-window properties, through the window's property
+    /// store. The store lives in window properties, which another process
+    /// may set; nothing of it runs inside LabVIEW.
+    mod taskbar {
+        use super::{Hwnd, Taskbar};
+        use std::ffi::c_void;
+
+        #[repr(C)]
+        struct Guid(u32, u16, u16, [u8; 8]);
+
+        #[repr(C)]
+        struct PropertyKey {
+            fmtid: Guid,
+            pid: u32,
+        }
+
+        /// PROPVARIANT holding a VT_LPWSTR: the type, three reserved words,
+        /// then the pointer, 24 bytes in all on x64.
+        #[repr(C)]
+        struct PropVariant {
+            vt: u16,
+            reserved: [u16; 3],
+            ptr: *const u16,
+            pad: usize,
+        }
+
+        #[repr(C)]
+        struct PropertyStoreVtbl {
+            query_interface: usize,
+            add_ref: usize,
+            release: unsafe extern "system" fn(*mut PropertyStore) -> u32,
+            get_count: usize,
+            get_at: usize,
+            get_value: usize,
+            set_value: unsafe extern "system" fn(*mut PropertyStore, *const PropertyKey, *const PropVariant) -> i32,
+            commit: unsafe extern "system" fn(*mut PropertyStore) -> i32,
+        }
+
+        #[repr(C)]
+        struct PropertyStore {
+            vtbl: *const PropertyStoreVtbl,
+        }
+
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn SHGetPropertyStoreForWindow(hwnd: Hwnd, iid: *const Guid, out: *mut *mut c_void) -> i32;
+        }
+
+        #[link(name = "ole32")]
+        unsafe extern "system" {
+            fn CoInitializeEx(reserved: *mut c_void, flags: u32) -> i32;
+        }
+
+        /// COM on this thread, which the property store is: once, before
+        /// the first `apply`. Left initialised until the process exits.
+        pub fn init() {
+            const COINIT_APARTMENTTHREADED: u32 = 0x2;
+            // SAFETY: no pointers; a failure only means COM was set up already.
+            unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
+        }
+
+        const IID_IPROPERTYSTORE: Guid = Guid(0x886D_8EEB, 0x8CF2, 0x4446, [0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99]);
+        /// PKEY_AppUserModel_*: one format id, these property ids.
+        const APP_USER_MODEL: (u32, u16, u16, [u8; 8]) =
+            (0x9F4C_2855, 0x9F79, 0x4B39, [0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3]);
+        const RELAUNCH_COMMAND: u32 = 2;
+        const RELAUNCH_ICON: u32 = 3;
+        const RELAUNCH_NAME: u32 = 4;
+        const ID: u32 = 5;
+        const VT_LPWSTR: u16 = 31;
+
+        fn key(pid: u32) -> PropertyKey {
+            let (a, b, c, d) = APP_USER_MODEL;
+            PropertyKey { fmtid: Guid(a, b, c, d), pid }
+        }
+
+        /// Set the relaunch properties, then the id: the taskbar reads the
+        /// relaunch ones when the id arrives.
+        pub fn apply(hwnd: Hwnd, t: &Taskbar) -> Result<(), String> {
+            let mut store: *mut c_void = std::ptr::null_mut();
+            // SAFETY: `store` receives an IPropertyStore pointer on success,
+            // released below; the IID is the one asked for.
+            let hr = unsafe { SHGetPropertyStoreForWindow(hwnd, &IID_IPROPERTYSTORE, &mut store) };
+            if hr < 0 || store.is_null() {
+                return Err(format!("SHGetPropertyStoreForWindow: {hr:#010x}"));
+            }
+            let store = store as *mut PropertyStore;
+            let props = [
+                (RELAUNCH_COMMAND, t.relaunch.as_str()),
+                (RELAUNCH_ICON, &format!("{},0", t.icon)),
+                (RELAUNCH_NAME, t.name.as_str()),
+                (ID, t.id.as_str()),
+            ];
+            let mut result = Ok(());
+            for (pid, value) in props {
+                let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+                let pv = PropVariant { vt: VT_LPWSTR, reserved: [0; 3], ptr: wide.as_ptr(), pad: 0 };
+                // SAFETY: a live IPropertyStore; the store copies the value
+                // before returning, while `wide` is still alive.
+                let hr = unsafe { ((*(*store).vtbl).set_value)(store, &key(pid), &pv) };
+                if hr < 0 {
+                    result = Err(format!("SetValue({pid}): {hr:#010x}"));
+                    break;
+                }
+            }
+            // SAFETY: the store obtained above, committed and released once.
+            unsafe {
+                if result.is_ok() {
+                    ((*(*store).vtbl).commit)(store);
+                }
+                ((*(*store).vtbl).release)(store);
+            }
+            result
+        }
     }
 }
 

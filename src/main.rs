@@ -37,6 +37,7 @@ mod resolve;
 mod shadow;
 mod shortcut;
 mod spec;
+mod venv_icon;
 mod target;
 mod update_notice;
 mod venv;
@@ -360,9 +361,21 @@ enum Cmd {
         /// The text to put in each title, e.g. `[my-project]`.
         #[arg(long)]
         tag: String,
-        /// `end` or `start`.
+        /// `end`, `start` or `off`.
         #[arg(long, default_value = "end")]
         position: String,
+        /// Windows app id to give each window, grouping them in the taskbar.
+        #[arg(long, requires_all = ["relaunch", "relaunch_icon", "relaunch_name"])]
+        app_id: Option<String>,
+        /// Command line a taskbar pin of the group runs.
+        #[arg(long)]
+        relaunch: Option<String>,
+        /// Icon of that pin; an `.ico` also goes on each window.
+        #[arg(long)]
+        relaunch_icon: Option<String>,
+        /// Name of that pin.
+        #[arg(long)]
+        relaunch_name: Option<String>,
     },
     /// Rewrite installed VI links and set libraries/classes source-only the
     /// way LabVIEW saves them. Defaults to the venv in effect; `--tree` takes
@@ -568,13 +581,24 @@ fn run(cli: &Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Launch { lvproj, ini_keys, no_check, .. } => cmd_launch(&cli, lvproj.as_deref(), ini_keys, *no_check),
-        Cmd::TitleWatch { pid, tag, position } => {
+        Cmd::TitleWatch { pid, tag, position, app_id, relaunch, relaunch_icon, relaunch_name } => {
             let pos: config::TitlePosition = position.parse()?;
             #[cfg(windows)]
-            return watcher::watch(*pid, tag, pos);
+            {
+                let taskbar = match (app_id, relaunch, relaunch_icon, relaunch_name) {
+                    (Some(id), Some(relaunch), Some(icon), Some(name)) => Some(watcher::Taskbar {
+                        id: id.clone(),
+                        relaunch: relaunch.clone(),
+                        icon: icon.clone(),
+                        name: name.clone(),
+                    }),
+                    _ => None,
+                };
+                watcher::watch(*pid, tag, pos, taskbar)
+            }
             #[cfg(not(windows))]
             {
-                let _ = (pid, tag, pos);
+                let _ = (pid, tag, pos, app_id, relaunch, relaunch_icon, relaunch_name);
                 bail!("title-watch is Windows-only");
             }
         }
@@ -2950,7 +2974,7 @@ fn cmd_launch(cli: &Cli, lvproj: Option<&Path>, ini_keys: &[String], no_check: b
     };
     let ini = launch::write_ini(&v, &extra)?;
     let child = launch::spawn(&v, &ini, lvproj.as_deref())?;
-    let titles = start_title_watcher(&v, child.id());
+    start_title_watcher(&v, child.id());
     log!("started {} on {}", v.target.label(), v.dir.display());
     log!("  ini            {}", ini.display());
     for (k, val) in &extra {
@@ -2960,33 +2984,48 @@ fn cmd_launch(cli: &Cli, lvproj: Option<&Path>, ini_keys: &[String], no_check: b
     if let Some(p) = &lvproj {
         log!("  opening        {}", p.display());
     }
-    if let Some(t) = titles {
-        log!("  window titles  {t}");
-    }
     Ok(())
 }
 
-/// Start the hidden watcher that keeps the venv's name in the window titles
-/// of the LabVIEW with process id `pid` (see `watcher`). Returns what to tell
-/// the user, or `None` when the setting is `off` or there is no watcher on
-/// this platform. Never fails the launch: a watcher that could not start is a
-/// warning.
-fn start_title_watcher(v: &venv::Venv, pid: u32) -> Option<String> {
+/// Start the hidden watcher beside the LabVIEW with process id `pid` (see
+/// `watcher`): it keeps the venv's name in the window titles, and gives the
+/// windows the venv's taskbar group and icon. Silent when it works, since it
+/// changes nothing the user has to act on; the log file says what it was
+/// given. Never fails the launch: a watcher that could not start is a
+/// warning. Windows only.
+fn start_title_watcher(v: &venv::Venv, pid: u32) {
     let pos = match config::load() {
         Ok(cfg) => cfg.venv_title,
         Err(e) => {
             wlog!("warning: window titles left as they are: {e:#}");
-            return None;
+            return;
         }
     };
-    if pos == config::TitlePosition::Off || !cfg!(windows) {
-        return None;
+    if !cfg!(windows) {
+        return;
     }
     let name = v.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "venv".into());
     let tag = format!("[{name}]");
+    // The taskbar group is always on. Its icon is the venv's badged one,
+    // LabVIEW's own when that could not be made.
+    let icon = venv_icon::write(v).unwrap_or_else(|e| {
+        wlog!("warning: taskbar pin gets LabVIEW's plain icon: {e:#}");
+        v.target.exe()
+    });
+    let relaunch = match shortcut::relaunch_command(v) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            wlog!("warning: no taskbar group for the venv: {e:#}");
+            return;
+        }
+    };
+    let app_id = shortcut::app_id(v);
     let started = std::env::current_exe().and_then(|exe| {
         let mut cmd = std::process::Command::new(exe);
         cmd.args(["title-watch", "--pid", &pid.to_string(), "--tag", &tag, "--position", pos.as_str()]);
+        cmd.args(["--app-id", &app_id, "--relaunch", &relaunch]);
+        cmd.arg("--relaunch-icon").arg(&icon);
+        cmd.args(["--relaunch-name", &shortcut::display_name(v)]);
         #[cfg(windows)]
         {
             // lvpm is a console program: without this, its watcher would
@@ -2997,11 +3036,8 @@ fn start_title_watcher(v: &venv::Venv, pid: u32) -> Option<String> {
         launch::spawn_detached(&mut cmd)
     });
     match started {
-        Ok(_) => Some(format!("{tag} at the {} (venv.title)", pos.as_str())),
-        Err(e) => {
-            wlog!("warning: could not start the window title watcher: {e}");
-            None
-        }
+        Ok(_) => log::debug!("window watcher: titles {tag} at {} (venv.title), taskbar group {app_id}", pos.as_str()),
+        Err(e) => wlog!("warning: could not start the window title watcher: {e}"),
     }
 }
 
