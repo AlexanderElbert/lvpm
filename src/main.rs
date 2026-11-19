@@ -35,13 +35,16 @@ mod refresh;
 mod relink;
 mod resolve;
 mod shadow;
+mod shortcut;
 mod spec;
+mod venv_icon;
 mod target;
 mod update_notice;
 mod venv;
 mod version;
 mod vipm_interop;
 mod viserver;
+mod watcher;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
@@ -343,6 +346,36 @@ enum Cmd {
         /// PostInstall hook still owed).
         #[arg(long)]
         no_check: bool,
+        /// Wait for Enter before exiting on an error, so a console opened by
+        /// a shortcut stays up long enough to read it.
+        #[arg(long, hide = true)]
+        pause_on_error: bool,
+    },
+    /// Keep a tag in the window titles of one LabVIEW until it exits.
+    /// Started hidden by `launch`; see the `venv.title` setting.
+    #[command(hide = true)]
+    TitleWatch {
+        /// Process id of the LabVIEW to watch.
+        #[arg(long)]
+        pid: u32,
+        /// The text to put in each title, e.g. `[my-project]`.
+        #[arg(long)]
+        tag: String,
+        /// `end`, `start` or `off`.
+        #[arg(long, default_value = "end")]
+        position: String,
+        /// Windows app id to give each window, grouping them in the taskbar.
+        #[arg(long, requires_all = ["relaunch", "relaunch_icon", "relaunch_name"])]
+        app_id: Option<String>,
+        /// Command line a taskbar pin of the group runs.
+        #[arg(long)]
+        relaunch: Option<String>,
+        /// Icon of that pin; an `.ico` also goes on each window.
+        #[arg(long)]
+        relaunch_icon: Option<String>,
+        /// Name of that pin.
+        #[arg(long)]
+        relaunch_name: Option<String>,
     },
     /// Rewrite installed VI links and set libraries/classes source-only the
     /// way LabVIEW saves them. Defaults to the venv in effect; `--tree` takes
@@ -421,6 +454,19 @@ enum VenvCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Write a Windows shortcut that runs `lvpm launch` on this venv, with
+    /// LabVIEW's icon. Goes in the project folder unless `--desktop` or
+    /// `--out` says otherwise.
+    Shortcut {
+        /// A `.lvproj` (or any LabVIEW file) the shortcut opens.
+        lvproj: Option<PathBuf>,
+        /// Put the shortcut on the desktop.
+        #[arg(long, conflicts_with = "out")]
+        desktop: bool,
+        /// Where to write the shortcut: a `.lnk` path, or a folder to put it in.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -450,6 +496,10 @@ fn main() -> Result<()> {
         notice.finish();
     }
     logging::finish(&result);
+    if let (Cmd::Launch { pause_on_error: true, .. }, Err(e)) = (&cli.cmd, &result) {
+        eprintln!("error: {e:#}\n\npress Enter to close");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
     result
 }
 
@@ -530,7 +580,28 @@ fn run(cli: &Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Launch { lvproj, ini_keys, no_check } => cmd_launch(&cli, lvproj.as_deref(), ini_keys, *no_check),
+        Cmd::Launch { lvproj, ini_keys, no_check, .. } => cmd_launch(&cli, lvproj.as_deref(), ini_keys, *no_check),
+        Cmd::TitleWatch { pid, tag, position, app_id, relaunch, relaunch_icon, relaunch_name } => {
+            let pos: config::TitlePosition = position.parse()?;
+            #[cfg(windows)]
+            {
+                let taskbar = match (app_id, relaunch, relaunch_icon, relaunch_name) {
+                    (Some(id), Some(relaunch), Some(icon), Some(name)) => Some(watcher::Taskbar {
+                        id: id.clone(),
+                        relaunch: relaunch.clone(),
+                        icon: icon.clone(),
+                        name: name.clone(),
+                    }),
+                    _ => None,
+                };
+                watcher::watch(*pid, tag, pos, taskbar)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (pid, tag, pos, app_id, relaunch, relaunch_icon, relaunch_name);
+                bail!("title-watch is Windows-only");
+            }
+        }
         Cmd::Linkfix { tree, dry_run, verbose, keep_compiled_code, fix, report, bitness } => {
             let mut methods: Vec<linkfix::Method> = if fix.is_empty() { linkfix::Method::ALL.to_vec() } else { fix.clone() };
             if *keep_compiled_code {
@@ -2720,6 +2791,30 @@ fn cmd_venv(cli: &Cli, sub: &VenvCmd) -> Result<()> {
             };
             venv::remove(&v, *yes)
         }
+        VenvCmd::Shortcut { lvproj, desktop, out } => {
+            let Some(v) = venv::find(cli.project.as_deref(), &cwd)? else {
+                bail!("no venv at or above {} — `lvpm venv create` makes one", cwd.display());
+            };
+            let lvproj = match lvproj {
+                Some(p) => {
+                    let p = std::path::absolute(p)?;
+                    ensure!(p.is_file(), "no such project file: {}", p.display());
+                    Some(p)
+                }
+                None => None,
+            };
+            let name = shortcut::file_name(&v, lvproj.as_deref());
+            let lnk = match (out, desktop) {
+                (Some(p), _) if p.is_dir() => std::path::absolute(p)?.join(&name),
+                (Some(p), _) => std::path::absolute(p)?.with_extension("lnk"),
+                (None, true) => shortcut::desktop()?.join(&name),
+                (None, false) => v.repo.join(&name),
+            };
+            shortcut::create(&v, lvproj.as_deref(), &lnk)?;
+            log!("wrote {}", lnk.display());
+            log!("  runs           lvpm {}", shortcut::arguments(&v, lvproj.as_deref()));
+            Ok(())
+        }
     }
 }
 
@@ -2878,7 +2973,8 @@ fn cmd_launch(cli: &Cli, lvproj: Option<&Path>, ini_keys: &[String], no_check: b
         None => None,
     };
     let ini = launch::write_ini(&v, &extra)?;
-    launch::spawn(&v, &ini, lvproj.as_deref())?;
+    let child = launch::spawn(&v, &ini, lvproj.as_deref())?;
+    start_title_watcher(&v, child.id());
     log!("started {} on {}", v.target.label(), v.dir.display());
     log!("  ini            {}", ini.display());
     for (k, val) in &extra {
@@ -2889,6 +2985,60 @@ fn cmd_launch(cli: &Cli, lvproj: Option<&Path>, ini_keys: &[String], no_check: b
         log!("  opening        {}", p.display());
     }
     Ok(())
+}
+
+/// Start the hidden watcher beside the LabVIEW with process id `pid` (see
+/// `watcher`): it keeps the venv's name in the window titles, and gives the
+/// windows the venv's taskbar group and icon. Silent when it works, since it
+/// changes nothing the user has to act on; the log file says what it was
+/// given. Never fails the launch: a watcher that could not start is a
+/// warning. Windows only.
+fn start_title_watcher(v: &venv::Venv, pid: u32) {
+    let pos = match config::load() {
+        Ok(cfg) => cfg.venv_title,
+        Err(e) => {
+            wlog!("warning: window titles left as they are: {e:#}");
+            return;
+        }
+    };
+    if !cfg!(windows) {
+        return;
+    }
+    let name = v.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "venv".into());
+    let tag = format!("[{name}]");
+    // The taskbar group is always on. Its icon is the venv's badged one,
+    // LabVIEW's own when that could not be made.
+    let icon = venv_icon::write(v).unwrap_or_else(|e| {
+        wlog!("warning: taskbar pin gets LabVIEW's plain icon: {e:#}");
+        v.target.exe()
+    });
+    let relaunch = match shortcut::relaunch_command(v) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            wlog!("warning: no taskbar group for the venv: {e:#}");
+            return;
+        }
+    };
+    let app_id = shortcut::app_id(v);
+    let started = std::env::current_exe().and_then(|exe| {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(["title-watch", "--pid", &pid.to_string(), "--tag", &tag, "--position", pos.as_str()]);
+        cmd.args(["--app-id", &app_id, "--relaunch", &relaunch]);
+        cmd.arg("--relaunch-icon").arg(&icon);
+        cmd.args(["--relaunch-name", &shortcut::display_name(v)]);
+        #[cfg(windows)]
+        {
+            // lvpm is a console program: without this, its watcher would
+            // open a console window of its own for LabVIEW's lifetime.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::os::windows::process::CommandExt::creation_flags(&mut cmd, CREATE_NO_WINDOW);
+        }
+        launch::spawn_detached(&mut cmd)
+    });
+    match started {
+        Ok(_) => log::debug!("window watcher: titles {tag} at {} (venv.title), taskbar group {app_id}", pos.as_str()),
+        Err(e) => wlog!("warning: could not start the window title watcher: {e}"),
+    }
 }
 
 /// Invoke Application methods by id and print each answer.

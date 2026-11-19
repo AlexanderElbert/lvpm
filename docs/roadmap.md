@@ -550,6 +550,11 @@ cache is already safe (SQLite in WAL mode, downloads renamed into place).
 
 ## Housekeeping
 
+- Window-title tagging (`venv.title`) covers LabVIEW started by `lvpm launch`
+  only. A venv LabVIEW started another way can be found by its
+  `-pref …\.lv-venv\labview.ini` command line; a `title-watch --attach` could
+  tag it. The LabVIEW an install starts for relink and hooks is not tagged.
+
 - `Replace Mode = If Newer` compares timestamps instead of "write when absent".
 - Read hook VIs' `error out` back.
 - A failure part-way through unpacking leaves files behind with no manifest.

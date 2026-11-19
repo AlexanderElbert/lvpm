@@ -17,6 +17,7 @@ empty value counts as unset. Precedence, highest first:
 | `LVPM_CONFIG_CACHE` | `%LOCALAPPDATA%\lvpm\cache` (Linux: `$XDG_CACHE_HOME/lvpm/cache`, else `~/.cache/lvpm/cache`) | Where the cache DB, feed bodies, and imported package archives live |
 | `LVPM_CONFIG_SOURCES_LOCAL` | Empty | Local `.vip` directories; separate paths with `;` on Windows or `:` on Linux |
 | `LVPM_CONFIG_VENV_DIR` | `.lv-venv` | Project-relative venv directory (or an absolute path) |
+| `LVPM_CONFIG_VENV_TITLE` | `end` | Where `lvpm launch` puts the venv's name in LabVIEW's window titles (Windows): `end`, `start`, or `off` (see [venvs.md](venvs.md#the-venvs-name-in-window-titles)) |
 | `LVPM_CONFIG_LOG_DIR` | `%LOCALAPPDATA%\lvpm\logs` (Linux: `lvpm/logs` in the cache folder) | Where lvpm's logs go: `lvpm.log` and one file per venv |
 
 ```powershell
@@ -25,6 +26,7 @@ lvpm config get sources.local
 lvpm config set sources.local                 # clear configured local sources
 lvpm config set venv.dir .venv
 lvpm config get venv.dir
+lvpm config set venv.title start              # [MyProject] Main.vi Front Panel ...
 lvpm config set log.dir D:\lvpm-logs
 # Or set LVPM_CONFIG_SOURCES_LOCAL for this shell; it overrides config.toml.
 $env:LVPM_CONFIG_SOURCES_LOCAL = 'D:\LabVIEW\Packages;E:\MorePackages'

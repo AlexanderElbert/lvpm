@@ -17,6 +17,45 @@ pub struct Config {
     pub venv_dir: PathBuf,
     /// Where lvpm's logs go: `lvpm.log`, and one file per venv.
     pub log_dir: PathBuf,
+    /// Where `lvpm launch` puts the venv's name in LabVIEW's window titles.
+    pub venv_title: TitlePosition,
+}
+
+/// Where the venv's name goes in a venv LabVIEW's window titles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TitlePosition {
+    /// `[name] x.vi Front Panel …`
+    Start,
+    /// `x.vi Front Panel … [name]`, before LabVIEW's `*` when there is one.
+    #[default]
+    End,
+    /// Titles are left as LabVIEW writes them.
+    Off,
+}
+
+impl TitlePosition {
+    pub const VALUES: &str = "end, start, off";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TitlePosition::Start => "start",
+            TitlePosition::End => "end",
+            TitlePosition::Off => "off",
+        }
+    }
+}
+
+impl std::str::FromStr for TitlePosition {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "start" => Ok(TitlePosition::Start),
+            "end" => Ok(TitlePosition::End),
+            "off" => Ok(TitlePosition::Off),
+            _ => bail!("venv.title {s:?}: expected one of {}", TitlePosition::VALUES),
+        }
+    }
 }
 
 pub fn load() -> Result<Config> {
@@ -43,6 +82,7 @@ struct SourcesConfig {
 #[serde(default)]
 struct VenvConfig {
     dir: Option<String>,
+    title: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -70,7 +110,11 @@ fn resolve(file: &FileConfig, env: impl Fn(&str) -> Option<String>) -> Result<Co
         Some(v) => std::path::absolute(v)?,
         None => default_log_dir(&cache),
     };
-    Ok(Config { cache, local_sources, venv_dir: PathBuf::from(venv_dir), log_dir })
+    let venv_title = match env_value(&env, "venv.title").or_else(|| file.venv.title.clone().filter(|v| !v.is_empty())) {
+        Some(v) => v.parse()?,
+        None => TitlePosition::default(),
+    };
+    Ok(Config { cache, local_sources, venv_dir: PathBuf::from(venv_dir), log_dir, venv_title })
 }
 
 /// Where lvpm's logs go, for the logger. Never fails: with a config file that
@@ -85,7 +129,7 @@ pub fn log_dir() -> PathBuf {
         .unwrap_or_else(|_| default_log_dir(&default_cache()))
 }
 
-const KEYS: &str = "cache, sources.local, venv.dir, log.dir";
+const KEYS: &str = "cache, sources.local, venv.dir, venv.title, log.dir";
 
 pub fn set(key: &str, values: &[String]) -> Result<()> {
     let mut file = read_file()?;
@@ -102,11 +146,16 @@ pub fn set(key: &str, values: &[String]) -> Result<()> {
                 .collect();
         }
         "venv.dir" if values.len() == 1 => file.venv.dir = Some(values[0].clone()),
+        "venv.title" if values.len() == 1 => {
+            let pos: TitlePosition = values[0].parse()?;
+            file.venv.title = Some(pos.as_str().to_string())
+        }
         "log.dir" if values.len() == 1 => {
             file.log.dir = Some(std::path::absolute(&values[0])?.to_string_lossy().into_owned())
         }
         "cache" => bail!("`config set cache` expects one value"),
         "venv.dir" => bail!("`config set venv.dir` expects one value"),
+        "venv.title" => bail!("`config set venv.title` expects one value: {}", TitlePosition::VALUES),
         "log.dir" => bail!("`config set log.dir` expects one value"),
         _ => bail!("unknown config key {key:?}; supported keys: {KEYS}"),
     }
@@ -124,6 +173,7 @@ pub fn get(key: &str) -> Result<Vec<String>> {
         "cache" => Ok(vec![cfg.cache.to_string_lossy().into_owned()]),
         "sources.local" => Ok(cfg.local_sources.iter().map(|p| p.to_string_lossy().into_owned()).collect()),
         "venv.dir" => Ok(vec![cfg.venv_dir.to_string_lossy().into_owned()]),
+        "venv.title" => Ok(vec![cfg.venv_title.as_str().to_string()]),
         "log.dir" => Ok(vec![cfg.log_dir.to_string_lossy().into_owned()]),
         _ => bail!("unknown config key {key:?}; supported keys: {KEYS}"),
     }
@@ -210,6 +260,21 @@ mod tests {
         assert!(cfg.local_sources.is_empty());
         assert_eq!(cfg.venv_dir, PathBuf::from(DEFAULT_VENV_DIR));
         assert_eq!(cfg.log_dir, default_log_dir(&cfg.cache));
+        assert_eq!(cfg.venv_title, TitlePosition::End);
+    }
+
+    #[test]
+    fn venv_title_from_file_is_overridden_by_environment_and_bad_values_fail() {
+        let file = FileConfig {
+            venv: VenvConfig { dir: None, title: Some("start".into()) },
+            ..FileConfig::default()
+        };
+        assert_eq!(resolve(&file, |_| None).unwrap().venv_title, TitlePosition::Start);
+        let env = |k: &str| (k == "LVPM_CONFIG_VENV_TITLE").then(|| "Off".to_string());
+        assert_eq!(resolve(&file, env).unwrap().venv_title, TitlePosition::Off);
+        let bad = |k: &str| (k == "LVPM_CONFIG_VENV_TITLE").then(|| "middle".to_string());
+        let err = resolve(&file, bad).unwrap_err().to_string();
+        assert!(err.contains("end, start, off"), "{err}");
     }
 
     #[test]
@@ -235,7 +300,7 @@ mod tests {
         let file = FileConfig {
             cache: Some("from-file".into()),
             sources: SourcesConfig { local: vec!["packages-a".into()] },
-            venv: VenvConfig { dir: Some(".from-file".into()) },
+            venv: VenvConfig { dir: Some(".from-file".into()), title: None },
             log: LogConfig { dir: Some("logs-from-file".into()) },
         };
         let from_file = resolve(&file, |_| None).unwrap();

@@ -61,6 +61,61 @@ pass done where `relink = true`, and PostInstall run where the hook policy
 runs it. It refuses on a mismatch and names each one; `--no-check` starts
 anyway. Files edited or resaved since install are not detected.
 
+`lvpm venv shortcut [<lvproj>]` writes a Windows shortcut,
+`<project> (LabVIEW <year> <bits>-bit).lnk`, that runs
+`lvpm --project <repo> launch [<lvproj>]` with LabVIEW's icon. The shortcut
+goes in the project folder by default. `--desktop` puts it on the desktop,
+and `--out PATH` takes a `.lnk` path or a folder. The shortcut runs `lvpm`,
+not `LabVIEW.exe`, because a shortcut cannot set the venv's temp directory and
+would skip the check above. When a launch from the shortcut fails, its console
+stays open until you press Enter. The shortcut records the full path of the
+`lvpm.exe` that wrote it, so recreate it if you move lvpm.
+
+### The venv's name in window titles
+
+On Windows, `launch` also starts a small hidden `lvpm` beside the venv
+LabVIEW that keeps the project folder's name in its window titles, so a venv
+IDE and your primary one (or two venvs) can be told apart in the taskbar and
+in Alt+Tab:
+
+```text
+MyProject.lvproj - Project Explorer [MyProject]
+Main.vi Front Panel on MyProject.lvproj/My Computer [MyProject] *
+```
+
+It tags the Getting Started window, Project Explorer, front panels, block
+diagrams and class or library windows; dialogs and palettes keep their
+titles. LabVIEW rewrites a title on every edit and save, and the watcher puts
+the tag back straight after, so it can be missing for a moment. LabVIEW's
+`*` for unsaved changes stays where LabVIEW shows it. The watcher reacts to
+window events only, uses no CPU in between, and exits with its LabVIEW; each
+launched venv LabVIEW has its own.
+
+The `venv.title` [setting](configuration.md#settings) moves the name to the
+front (`start`) or turns this off (`off`) — for instance for a tool that finds
+LabVIEW's windows by their exact title. A LabVIEW on the venv started some
+other way than `lvpm launch` is not tagged.
+
+### The venv's icon and taskbar button
+
+The same watcher gives the venv LabVIEW's windows an icon and a taskbar
+button of their own. The icon is the bound LabVIEW's icon with a coloured disc
+in the upper right. The colour comes from the project folder's name, so two
+venvs differ and each keeps its colour. lvpm writes it to `.lv-venv\venv.ico` at each launch and for
+`venv shortcut`. It shows in the title bars, on the taskbar and in Alt+Tab.
+
+LabVIEW groups all its windows under one taskbar button per LabVIEW
+version. The watcher gives each venv's windows an app id of their own
+(`lvpm.venv.<hash of the project path>`), so a venv's LabVIEW gets its own
+button, separate from your normal LabVIEW and from other venvs. Right-click
+that button and choose *Pin to taskbar*: the pin shows the venv's icon and
+name, and clicking it runs `lvpm --project <repo> launch`. The pin records the
+full path of the `lvpm.exe` that launched the venv, so pin it again if you
+move lvpm.
+
+The properties lvpm sets on LabVIEW's windows go away when that LabVIEW
+exits.
+
 ## Layout
 
 ```text
