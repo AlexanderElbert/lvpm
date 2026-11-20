@@ -732,9 +732,9 @@ impl HookPolicy {
     fn why_not(&self, pkg: &str) -> &'static str {
         match (self.mode, self.setting(pkg)) {
             (HookMode::Never, _) => "--no-hooks",
-            (_, Some(project::Hooks::Skip)) => "hooks = \"skip\" in the manifest",
-            _ if self.venv => "a venv runs a package's hooks only with hooks = \"run\" in the manifest",
-            _ => "LabVIEW runs headless here (LV_RTE_HEADLESS); hooks = \"run\" or --hooks runs them",
+            (_, Some(project::Hooks::Skip)) => "hooks = \"skip\" in lvpm.toml",
+            _ if self.venv => "a venv runs a package's hooks only when lvpm.toml lists it as <pkg> = { version = \"…\", hooks = \"run\" }, or with --hooks",
+            _ => "LabVIEW runs headless here (LV_RTE_HEADLESS); <pkg> = { version = \"…\", hooks = \"run\" } in lvpm.toml or --hooks runs them",
         }
     }
 }
@@ -1369,18 +1369,16 @@ fn cmd_list(cli: &Cli) -> Result<()> {
             policy.allows(&m.name)
                 && (post.ends_with("PENDING") || post.ends_with("FAILED") || post.ends_with("unknown") || post.ends_with("skipped")),
         );
-        // Records from before hook state was tracked list PostInstall here;
-        // the column above says what is known about it now.
-        let skipped: Vec<&String> = m.skipped_hooks.iter().filter(|h| !h.starts_with("PostInstall=")).collect();
+        // Hooks a venv can never run (PreInstall, the uninstall hooks) are not
+        // shown: there is nothing to do about them.
         log!(
-            "{:<52} {:<14} {:>5} files  {:<12} {:<20}{}",
+            "{:<52} {:<14} {:>5} files  {:<12} {}",
             m.name,
             m.version,
             m.files.len(),
             // Linkfix prepares every install; LabVIEW's relink is the opt-in exception.
             if m.relinked { "relinked" } else { "" },
             post,
-            if skipped.is_empty() { String::new() } else { format!("  (hooks not run: {})", hook_names(skipped)) }
         );
     }
     if owed > 0 {
@@ -1413,6 +1411,14 @@ fn cmd_refresh(cli: &Cli, timeout: u64) -> Result<()> {
     };
     refresh_palettes_and_menus(&t, timeout);
     Ok(())
+}
+
+/// A venv LabVIEW reads its palettes at startup: one already running does not
+/// show a rebuilt `venv-palettes` addon until it is restarted.
+fn note_palette_change(dest: &Destination, changed: bool) {
+    if changed && let Destination::Venv(v) = dest && launch::is_running(v) {
+        log!("palettes: changed; restart the venv's LabVIEW to see them");
+    }
 }
 
 fn cmd_uninstall(
@@ -1553,7 +1559,9 @@ fn cmd_uninstall(
     unsave_now();
 
     if uninstalled_any && roots.venv().is_some() {
-        palette::reconcile(&roots).context("packages were removed, but venv palettes could not be reconciled")?;
+        let changed = palette::reconcile(&roots)
+            .context("packages were removed, but venv palettes could not be reconciled")?;
+        note_palette_change(&dest, changed);
     }
 
     // The same reason as on install, in reverse: the packages' `.mnu` files
@@ -1676,12 +1684,9 @@ fn uninstall_one(
                 && (h.starts_with("PreUninstall=") || h.starts_with("PostUninstall="))
         })
         .collect();
-    if !unrun.is_empty() {
-        let why = match hooks {
-            true => "installed before uninstall hooks existed",
-            false => "hooks do not run in a venv",
-        };
-        log!("note: declared but not run ({why}): {}", hook_names(unrun));
+    // In a venv they never run; nothing to say about that.
+    if !unrun.is_empty() && hooks {
+        log!("note: declared but not run (installed before uninstall hooks existed): {}", hook_names(unrun));
     }
     Ok(removed)
 }
@@ -1973,8 +1978,14 @@ fn cmd_install(
     let mut relink_work: Vec<(String, Vec<PathBuf>)> = Vec::new();
     let mut linkfix_files = Vec::new();
 
-    if !dry_run && venv.is_some() {
-        palette::reconcile(&store).context("migrating and reconciling existing venv palettes")?;
+    // Migrates package-local menus before anything is uninstalled or upgraded.
+    // Not fatal: a conflict already in the venv must not block the install
+    // that resolves it, and the reconcile after the install is the one that
+    // counts — it fails on whatever is still wrong then.
+    if !dry_run && venv.is_some()
+        && let Err(e) = palette::reconcile(&store)
+    {
+        wlog!("palettes: {e:#}; retrying after the install");
     }
 
     for e in &plan {
@@ -2102,13 +2113,13 @@ fn cmd_install(
         // Warn only about hooks this install owes and will not run. Allowed
         // globally, PreInstall has run, PostInstall runs after the relink
         // pass, and the uninstall hooks are extracted for `lvpm uninstall` —
-        // nothing to say. In a venv PreInstall cannot run (see above); a
-        // package the policy holds back runs none, so every declared one is
-        // reported.
+        // nothing to say. A package the policy holds back runs none, so every
+        // declared one is reported. Hooks a venv can never run (PreInstall)
+        // are not: there is nothing to do about them.
         let skipped: Vec<String> = spec
             .script_vis
             .iter()
-            .filter(|(h, _)| !policy.allows(&e.name) || (h == "PreInstall" && venv.is_some()))
+            .filter(|(_, _)| !policy.allows(&e.name))
             .map(|(h, v)| format!("{h}={v}"))
             .collect();
         if !skipped.is_empty() {
@@ -2117,7 +2128,8 @@ fn cmd_install(
         }
     }
     if !dry_run && venv.is_some() {
-        palette::reconcile(&store).context("reconciling venv palettes after install")?;
+        let changed = palette::reconcile(&store).context("reconciling venv palettes after install")?;
+        note_palette_change(&dest, changed);
     }
     if hooks_unrun && hook_mode == HookMode::Default {
         log!(
@@ -2191,13 +2203,14 @@ fn cmd_install(
                 None => by_reason.push((why, vec![n])),
             }
         }
+        // A count on screen; which packages is `lvpm list`'s job, and the log's.
         for (why, names) in by_reason {
             log!(
-                "\n{} post-install hook(s) {} ({why}): {}",
+                "\n{} post-install hook(s) {} ({why}); `lvpm list` shows which",
                 names.len(),
                 if dry_run { "would not run" } else { "not run" },
-                names.join(", ")
             );
+            log::info!("post-install hooks held back ({why}): {}", names.join(", "));
         }
     }
 
@@ -2416,10 +2429,13 @@ fn cmd_run_hooks(cli: &Cli, package: Option<&str>, all: bool, timeout: u64) -> R
         let (allowed, held): (Vec<_>, Vec<_>) = work.into_iter().partition(|m| policy.allows(&m.name));
         if !held.is_empty() {
             log!(
-                "not running {} hook(s) the policy holds back ({}): {}\n      \
+                "not running {} hook(s) the policy holds back ({}); `lvpm list` shows which\n      \
                  `lvpm run-hooks <package>` runs one anyway",
                 held.len(),
                 policy.why_not(&held[0].name),
+            );
+            log::info!(
+                "hooks held back: {}",
                 held.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", ")
             );
         }

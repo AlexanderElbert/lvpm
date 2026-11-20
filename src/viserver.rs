@@ -25,6 +25,7 @@
 //! Replies pair to requests by `uID`. `ReleaseRef` is fire-and-forget — LabVIEW
 //! sends nothing back, so we must not block waiting for it.
 
+use crate::launch::read_ini_file;
 use crate::target::LvTarget;
 use anyhow::{Context, Result, bail, ensure};
 use std::io::{Read, Write};
@@ -35,7 +36,7 @@ use std::time::Duration;
 /// Read a `key=value` token out of a target's `LabVIEW.ini` (`labview.conf`
 /// on Linux — see [`LvTarget::ini`]).
 fn ini_token(target: &LvTarget, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(target.ini()).ok()?;
+    let text = read_ini_file(&target.ini()).ok()?;
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix(key)

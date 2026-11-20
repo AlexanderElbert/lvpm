@@ -3,7 +3,8 @@
 #
 #   cargo about generate --locked -o THIRD-PARTY-LICENSES.txt about.hbs
 #
-# build.yml fails while the committed file is stale.
+# The release runs that before each build (.github/build-setup.yml); the file
+# is not in git. Run it locally to build an MSI or check the output.
 
 # The licenses lvpm's dependencies may use. A new dependency under any other
 # license fails generation, so it gets looked at before it ships.

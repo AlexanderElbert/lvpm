@@ -39,6 +39,38 @@ const EOL: &str = "\r\n";
 #[cfg(not(windows))]
 const EOL: &str = "\n";
 
+/// An ini file's text, one `char` per byte. The file is not UTF-8: LabVIEW
+/// writes it in the ANSI code page, and LabVIEW 2025 was seen writing stray
+/// bytes into key names (`ProbeDefaultCache_25_0\x??=""`). Read byte by byte,
+/// any content survives a rewrite exactly; see [`write_ini_file`].
+pub fn read_ini_file(path: &Path) -> std::io::Result<String> {
+    Ok(std::fs::read(path)?.into_iter().map(char::from).collect())
+}
+
+/// Write text from [`read_ini_file`] back, one byte per `char`. Values lvpm
+/// adds must have gone through [`ini_value`].
+fn write_ini_file(path: &Path, text: &str) -> std::io::Result<()> {
+    let bytes: Vec<u8> = text
+        .chars()
+        .map(|c| u8::try_from(c).expect("ini text holds only byte-sized chars"))
+        .collect();
+    std::fs::write(path, bytes)
+}
+
+/// `s` in the byte-per-char form of [`read_ini_file`], encoded as LabVIEW
+/// reads its ini: the ANSI code page on Windows (Latin-1 here, which is
+/// Windows-1252 outside 0x80–0x9F), UTF-8 on Linux.
+fn ini_value(s: &str) -> Result<String> {
+    if cfg!(windows) {
+        match s.chars().find(|&c| u8::try_from(c).is_err()) {
+            Some(c) => bail!("{s:?}: '{c}' cannot be written to LabVIEW.ini"),
+            None => Ok(s.to_string()),
+        }
+    } else {
+        Ok(s.bytes().map(char::from).collect())
+    }
+}
+
 /// Set `key=value` lines in an ini text: replace in place where the key exists
 /// (however it was spaced), append where it does not, and never write a key
 /// twice. Everything else is preserved as it was — the inherited ini is what
@@ -132,7 +164,7 @@ pub fn write_ini(v: &Venv, extra: &[(String, String)]) -> Result<PathBuf> {
         true => dest.clone(),
         false => v.target.ini(),
     };
-    let mut text = match std::fs::read_to_string(&src) {
+    let mut text = match read_ini_file(&src) {
         Ok(text) => text,
         // On Linux the target's file is per user and only exists once this
         // user has started LabVIEW; until then the defaults are all there is
@@ -152,10 +184,14 @@ pub fn write_ini(v: &Venv, extra: &[(String, String)]) -> Result<PathBuf> {
     }
     let packages = v.packages_dir();
     std::fs::create_dir_all(&packages).with_context(|| format!("creating {}", packages.display()))?;
-    let location = ini_path(&packages);
-    let objcache = ini_path(&objcache);
-    let data = ini_path(&data);
+    let location = ini_value(&ini_path(&packages))?;
+    let objcache = ini_value(&ini_path(&objcache))?;
+    let data = ini_value(&ini_path(&data))?;
     let port = v.port.to_string();
+    let extra = extra
+        .iter()
+        .map(|(k, val)| Ok((ini_value(k)?, ini_value(val)?)))
+        .collect::<Result<Vec<_>>>()?;
     let mut keys: Vec<(&str, &str)> = vec![
         ("LVAddons.AdditionalLocations", &location),
         ("server.tcp.enabled", "True"),
@@ -174,7 +210,7 @@ pub fn write_ini(v: &Venv, extra: &[(String, String)]) -> Result<PathBuf> {
     let out = override_keys(&text, &keys);
 
     std::fs::create_dir_all(dest.parent().expect("ini path has a parent"))?;
-    std::fs::write(&dest, out).with_context(|| format!("writing {}", dest.display()))?;
+    write_ini_file(&dest, &out).with_context(|| format!("writing {}", dest.display()))?;
     Ok(dest)
 }
 
@@ -496,6 +532,26 @@ mod tests {
             drop_keys(ini, RECENT_KEYS),
             format!("[LabVIEW]{EOL}RecentFiles.maxNum=10{EOL}server.tcp.port=3364{EOL}")
         );
+    }
+
+    #[test]
+    fn an_ini_that_is_not_utf8_round_trips_byte_for_byte() {
+        // As found in a LabVIEW 2025 LabVIEW.ini: stray bytes in key names.
+        let dir = std::env::temp_dir().join(format!("lvpm-ini-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("src.ini"), dir.join("dest.ini"));
+        let lines: [&[u8]; 3] = [b"[LabVIEW]", b"ProbeDefaultCache_25_0\x9a=\"\"", b"\xc0\x81=00DC6E00"];
+        let joined = |lines: &[&[u8]]| -> Vec<u8> {
+            lines.iter().flat_map(|l| [*l, EOL.as_bytes()].concat()).collect()
+        };
+        std::fs::write(&src, joined(&lines)).unwrap();
+        let text = read_ini_file(&src).unwrap();
+        let out = override_keys(&text, &[("a", &ini_value("C:\\Jörg").unwrap())]);
+        write_ini_file(&dest, &out).unwrap();
+        // The added value in the encoding LabVIEW reads on each platform.
+        let added: &[u8] = if cfg!(windows) { b"a=C:\\J\xf6rg" } else { b"a=C:\\J\xc3\xb6rg" };
+        assert_eq!(std::fs::read(&dest).unwrap(), joined(&[lines[0], lines[1], lines[2], added]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
