@@ -192,7 +192,13 @@ pub fn read_manifest(roots: &Roots, name: &str) -> Result<Manifest> {
 }
 
 pub fn list_installed(roots: &Roots) -> Result<Vec<Manifest>> {
-    let (manifests, mut unreadable) = list_installed_lenient(roots)?;
+    list_installed_with(roots, |_| Ok(()))
+}
+
+pub(crate) fn list_installed_with(
+    roots: &Roots, check_path: impl FnMut(&Path) -> Result<()>,
+) -> Result<Vec<Manifest>> {
+    let (manifests, mut unreadable) = list_installed_lenient_with(roots, check_path)?;
     match unreadable.is_empty() {
         true => Ok(manifests),
         false => Err(unreadable.remove(0).1),
@@ -209,6 +215,12 @@ pub type Unreadable = (PathBuf, anyhow::Error);
 /// (`uninstall`, `list`, `run-hooks --all`) uses [`list_installed`], which
 /// refuses instead.
 pub fn list_installed_lenient(roots: &Roots) -> Result<(Vec<Manifest>, Vec<Unreadable>)> {
+    list_installed_lenient_with(roots, |_| Ok(()))
+}
+
+pub(crate) fn list_installed_lenient_with(
+    roots: &Roots, mut check_path: impl FnMut(&Path) -> Result<()>,
+) -> Result<(Vec<Manifest>, Vec<Unreadable>)> {
     let dir = roots.store_dir();
     if !dir.exists() {
         return Ok((Vec::new(), Vec::new()));
@@ -222,6 +234,7 @@ pub fn list_installed_lenient(roots: &Roots) -> Result<(Vec<Manifest>, Vec<Unrea
     paths.sort();
     for path in paths {
         if path.extension().is_some_and(|ext| ext == "json") {
+            check_path(&path)?;
             let read = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display())).and_then(|text| {
                 serde_json::from_str::<Manifest>(&text)
                     .with_context(|| format!("reading installation record {} (dependency list required)", path.display()))
