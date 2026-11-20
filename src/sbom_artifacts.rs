@@ -1,4 +1,4 @@
-//! Inventory the files explicitly selected for distribution.
+//! Inventory explicitly selected distribution files and native project sources.
 
 use crate::sbom_paths::{OutputGuard, diagnostic_path};
 use anyhow::{Context, Result, ensure};
@@ -22,10 +22,10 @@ impl Inventory {
     pub(crate) fn verify_sources(&self) -> Result<()> {
         for artifact in &self.files {
             let (digest, size) = hash_file(&artifact.path, None)
-                .with_context(|| format!("rechecking build artifact {:?}", artifact.key))?;
+                .with_context(|| format!("rechecking inventoried file {:?}", artifact.key))?;
             ensure!(
                 digest == artifact.sha256 && size == artifact.size,
-                "build artifact {:?} changed after it was inventoried",
+                "file {:?} changed after it was inventoried",
                 artifact.key
             );
         }
@@ -64,7 +64,7 @@ impl ArtifactFile {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Snapshots {
     root: Option<PathBuf>,
     #[cfg(windows)]
@@ -271,24 +271,8 @@ pub(crate) fn scan(
         } else {
             guard.protect(&path)?;
             let key = logical_key(&path, &base)?;
-            let (sha256, size, inspection) = (|| {
-                if requires_snapshot(&key) {
-                    let (inspection, mut file) = snapshots.create(&output, &path, files.len())?;
-                    let (sha256, size) = hash_file(&path, Some(&mut file))?;
-                    Ok::<_, anyhow::Error>((sha256, size, Some(inspection)))
-                } else {
-                    let (sha256, size) = hash_file(&path, None)?;
-                    Ok((sha256, size, None))
-                }
-            })()
-            .with_context(|| format!("reading build artifact {}", diagnostic_path(&path)))?;
-            files.push(ArtifactFile {
-                key,
-                path,
-                inspection,
-                sha256,
-                size,
-            });
+            let file = inventory_file(path, key, &output, &mut snapshots, files.len())?;
+            files.push(file);
         }
     }
     files.sort_by(|left, right| left.key.cmp(&right.key));
@@ -297,6 +281,62 @@ pub(crate) fn scan(
         files,
         directories,
         _snapshots: snapshots,
+    })
+}
+
+/// Capture native project inputs without inferring a shared artifact root or
+/// claiming these files are part of a shipped output.
+pub(crate) fn scan_project_dlls(
+    paths: &BTreeMap<String, PathBuf>,
+    guard: &OutputGuard,
+) -> Result<Inventory> {
+    let output = guard.destination();
+    let mut snapshots = Snapshots::default();
+    let mut files = Vec::with_capacity(paths.len());
+    for (key, path) in paths {
+        guard.protect(path)?;
+        let file = inventory_file(
+            path.clone(),
+            key.clone(),
+            &output,
+            &mut snapshots,
+            files.len(),
+        )?;
+        files.push(file);
+    }
+
+    Ok(Inventory {
+        scopes: Vec::new(),
+        files,
+        directories: Vec::new(),
+        _snapshots: snapshots,
+    })
+}
+
+fn inventory_file(
+    path: PathBuf,
+    key: String,
+    output: &Path,
+    snapshots: &mut Snapshots,
+    index: usize,
+) -> Result<ArtifactFile> {
+    let (sha256, size, inspection) = (|| {
+        if requires_snapshot(&key) {
+            let (inspection, mut file) = snapshots.create(output, &path, index)?;
+            let (sha256, size) = hash_file(&path, Some(&mut file))?;
+            Ok::<_, anyhow::Error>((sha256, size, Some(inspection)))
+        } else {
+            let (sha256, size) = hash_file(&path, None)?;
+            Ok((sha256, size, None))
+        }
+    })()
+    .with_context(|| format!("reading inventoried file {}", diagnostic_path(&path)))?;
+    Ok(ArtifactFile {
+        key,
+        path,
+        inspection,
+        sha256,
+        size,
     })
 }
 

@@ -21,7 +21,7 @@ and what changes before it is called stable, are in [cli.md](cli.md).
 | `lvpm launch [<lvproj>]`                             | Check the venv against the manifest, then start a LabVIEW on it (see [venvs.md](venvs.md#launching-labview))                                 |
 | `lvpm config get` / `set`                            | Read or change user-level settings (see [configuration.md](configuration.md))                                                                |
 | `lvpm cache add <path>`                              | Import package archives into the shared cache (see [package-sources.md](package-sources.md#the-cache))                                      |
-| [`lvpm sbom`](#sbom)                                  | Export installed packages, saved build specifications or selected artifacts as CycloneDX 1.5 JSON |
+| [`lvpm sbom`](#sbom)                                  | Export installed packages, saved LabVIEW projects and build specifications, or selected artifacts as CycloneDX 1.5 JSON |
 | `lvpm import <file>`                                 | Write VIPM's `vipm.toml` or a `.vipc` into `lvpm.toml` once (see [compatibility.md](compatibility.md))                                      |
 | `lvpm vi-probe` / `vi-run` / `vi-save` / `app-probe` | VI Server primitives, for diagnosis (see [install-process.md](install-process.md#vi-server))                                                 |
 
@@ -97,7 +97,7 @@ The SBOM commands share the [global flags](#flags-for-every-command).
 Place them before or after `sbom`, `sbom merge`, or `sbom diff`.
 Their effect depends on the export mode.
 
-| Flag | Export installed packages from `lvpm.toml` | Static VI dependency scan for EXE, SRC, or PPL |
+| Flag | Export installed packages from `lvpm.toml` | Static VI dependency scan |
 | --- | --- | --- |
 | `--labview-version <YYYY>` | Selects the LabVIEW installation for a global export. A selected venv uses its bound version. | Selects the LabVIEW installation when no venv is selected. A selected venv uses its bound version. |
 | `--project <DIR>` | Uses the project's venv and its bound manifest. | Uses the project's venv for file ownership. Pass the saved project separately with `--lvproj`. |
@@ -118,6 +118,40 @@ SBOM commands use local inputs, so `--refresh` does not query package
 indexes. The CLI validates `--log-level` and returns exit code 2 for
 invalid levels. SBOM commands keep file logging disabled and report
 diagnostics separately.
+
+### Scan a saved LabVIEW project
+
+Use `--lvproj` on its own to scan the saved source items of all targets.
+lvpm starts with the VI and library items, follows their static links and
+looks inside physical folders declared in the project. The saved build
+specifications and LabVIEW's generated Dependencies tree are outside the
+root selection. Files shared by multiple targets are scanned once in the
+selected LabVIEW environment.
+
+```powershell
+lvpm sbom --lvproj MyProject.lvproj --output project.cdx.json
+lvpm sbom --lvproj MyProject.lvproj --include manual.cdx.json --output project-with-manual.cdx.json
+```
+
+The product name comes from the project filename. The scan matches files
+against lvpm installation records and, on Windows, the selected LabVIEW
+installation's VIPM database when present. It reads the database directly
+from disk. Use `--vipm-database <DIR>` to override the database. Unowned
+external files are counted in the SBOM. This mode needs no project manifest.
+
+The scan reads recorded imports from available PPLs. Explicit DLL items
+and DLLs under declared physical folders include a file hash and available
+PE import evidence. These components describe project files. For a release
+file inventory, use the corresponding build specification and its
+actual output files. See [Inventory published build outputs](#inventory-published-build-outputs)
+for PE import resolution limits.
+
+Use `--allow-incomplete` to export a partial graph when some sources or
+links cannot be read. The command retains scan issues in the SBOM.
+`--include` adds manually tracked components as direct project dependencies.
+The project-wide mode rejects `--artifact`.
+For a build-specific scan, the target and build specification must be
+supplied together.
 
 ### Build specification support
 
@@ -341,9 +375,9 @@ to bypass a venv, or `--labview-version <YYYY>` to select a LabVIEW
 installation when no venv is in effect.
 
 File ownership is matched against the paths actually scanned. lvpm reads
-the active venv's records and the base installation's records. On Windows it
-also reads the matching VIPM database when present. Use `--vipm-database <DIR>`
-to supply a different VIPM database for that installation. The VIPM reader
+the active venv's records and the base installation's records. On Windows,
+it also reads the matching VIPM database when present. Use
+`--vipm-database <DIR>` to supply a different database. The offline reader
 uses the absolute paths in each package's `files-installed` list and reads
 the package version and metadata from its archived spec. Each package
 appears once per version, with the number of matched files. The graph

@@ -765,6 +765,265 @@ fn project_sbom_merges_a_separate_sidecar_into_a_transitive_packed_library() {
 }
 
 #[test]
+fn sbom_scans_saved_project_items_across_targets() {
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+
+    let lab = Lab::new("whole-project-sbom");
+    lab.package_with(
+        "source-dependency",
+        "1.0.0.1",
+        "",
+        "[File Group 1]\nTarget Dir=\"<vi.lib>/source-dependency\"\nReplace Mode=\"Always\"\nNum Files=1\nFile 0=\"dependency.lvlib\"\n",
+        &[("File Group 1/dependency.lvlib", b"<Library/>")],
+    );
+    lab.write_manifest("[dependencies]\nsource-dependency = \"*\"\n");
+    lab.ok(&["venv", "create"]);
+    lab.ok(&["install", "--no-linkfix"]);
+
+    let project = lab.project();
+    let packed = packed_library_fixture(true);
+    let leaf = packed_library_fixture(false);
+    std::fs::create_dir(project.join("support")).unwrap();
+    std::fs::create_dir(project.join("native")).unwrap();
+    std::fs::write(project.join("demo.lvlibp"), &packed).unwrap();
+    std::fs::write(project.join("support/helper.lvlibp"), &leaf).unwrap();
+    std::fs::write(project.join("native/folder.dll"), &leaf).unwrap();
+    let mut dll = leaf;
+    // Add a regular import descriptor and its module name in unused PE section bytes.
+    dll[0x100..0x104].copy_from_slice(&0x11a0u32.to_le_bytes());
+    dll[0x104..0x108].copy_from_slice(&40u32.to_le_bytes());
+    dll[0x3ac..0x3b0].copy_from_slice(&0x11e0u32.to_le_bytes());
+    dll[0x3e0..0x3eb].copy_from_slice(b"System.dll\0");
+    std::fs::write(project.join("explicit.dll"), &dll).unwrap();
+    std::fs::write(
+        project.join("workspace.lvlib"),
+        br#"<Library><Item Type="Library" URL="&lt;vilib&gt;/source-dependency/dependency.lvlib"/></Library>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("Demo.lvproj"),
+        r#"<Project>
+  <Item Name="My Computer" Type="My Computer">
+    <Item Name="demo.lvlibp" Type="LVLibp" URL="../demo.lvlibp"/>
+    <Item Name="explicit.dll" Type="Document" URL="../explicit.dll"/>
+    <Item Name="Dependencies" Type="Dependencies">
+      <Item Name="cached.dll" Type="Document" URL="../cached.dll"/>
+    </Item>
+    <Item Name="Build Specifications" Type="Build">
+      <Item Name="Program" Type="EXE">
+        <Property Name="Source[0].itemID">/My Computer/demo.lvlibp</Property>
+        <Property Name="Source[0].sourceInclusion">Include</Property>
+        <Item Name="build-only.dll" Type="Document" URL="../build-only.dll"/>
+      </Item>
+    </Item>
+  </Item>
+  <Item Name="Other Target" Type="RT Target">
+    <Item Name="Packed Library Alias.lvlibp" Type="LVLibp" URL="../demo.lvlibp"/>
+    <Item Name="Development" Type="Folder">
+      <Item Name="workspace.lvlib" Type="Library" URL="../workspace.lvlib"/>
+    </Item>
+    <Item Name="Native" Type="Folder" URL="../native">
+      <Property Name="NI.DISK" Type="Bool">true</Property>
+    </Item>
+  </Item>
+</Project>"#,
+    )
+    .unwrap();
+
+    fn property<'a>(node: &'a Value, name: &str) -> Option<&'a str> {
+        node["properties"]
+            .as_array()?
+            .iter()
+            .find(|item| item["name"] == name)?["value"]
+            .as_str()
+    }
+
+    fn dependency_row<'a>(bom: &'a Value, reference: &Value) -> &'a [Value] {
+        bom["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| &row["ref"] == reference)
+            .unwrap()["dependsOn"]
+            .as_array()
+            .unwrap()
+    }
+
+    let raw = project.join("project.cdx.json");
+    lab.ok(&[
+        "sbom",
+        "--lvproj",
+        "Demo.lvproj",
+        "--output",
+        "project.cdx.json",
+    ]);
+    let raw_bytes = std::fs::read(&raw).unwrap();
+    let bom: Value = serde_json::from_slice(&raw_bytes).unwrap();
+    let metadata = &bom["metadata"];
+    assert_eq!(property(metadata, "lvpm:labview:scan-scope"), Some("project"));
+    assert_eq!(
+        property(metadata, "lvpm:labview:ownership-source"),
+        Some("installed-file-ownership")
+    );
+    let subject = &metadata["component"];
+    assert_eq!(subject["name"], "Demo");
+    assert!(subject.get("version").is_none());
+    let components = bom["components"].as_array().unwrap();
+    let component = |name: &str| {
+        let found: Vec<_> = components
+            .iter()
+            .filter(|node| node["name"] == name)
+            .collect();
+        assert_eq!(found.len(), 1, "expected one component named {name}: {bom}");
+        found[0]
+    };
+    let roots = dependency_row(&bom, &subject["bom-ref"]);
+    let package = component("source-dependency");
+    assert_eq!(package["purl"], "pkg:generic/vipm/source-dependency@1.0.0.1");
+    assert!(roots.contains(&package["bom-ref"]));
+
+    let parent_ppl = component("demo.lvlibp");
+    let child_ppl = component("helper.lvlibp");
+    assert!(roots.contains(&parent_ppl["bom-ref"]));
+    assert_eq!(
+        dependency_row(&bom, &parent_ppl["bom-ref"]),
+        &[child_ppl["bom-ref"].clone()]
+    );
+    assert_eq!(property(parent_ppl, "lvpm:ppl:shipment"), None);
+
+    for (name, key) in [
+        ("explicit.dll", "explicit.dll"),
+        ("folder.dll", "native/folder.dll"),
+    ] {
+        let binary = component(name);
+        assert_eq!(binary["type"], "library");
+        assert!(
+            binary["bom-ref"]
+                .as_str()
+                .unwrap()
+                .starts_with("lvpm:labview:project-file:")
+        );
+        assert!(
+            property(binary, "lvpm:labview:project-path")
+                .unwrap()
+                .ends_with(key)
+        );
+        let bytes = std::fs::read(project.join(key)).unwrap();
+        let digest: String = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(binary["hashes"], json!([{"alg": "SHA-256", "content": digest}]));
+        assert!(roots.contains(&binary["bom-ref"]));
+    }
+    let explicit = component("explicit.dll");
+    assert_eq!(property(explicit, "lvpm:pe:machine"), Some("0x014c"));
+    let import: Value = serde_json::from_str(property(explicit, "lvpm:pe:import").unwrap()).unwrap();
+    assert_eq!(import["name"], "System.dll");
+    assert_eq!(import["status"], "unresolved");
+    assert!(
+        dependency_row(&bom, &explicit["bom-ref"])
+            .contains(&json!("lvpm:pe:import:014c:system.dll"))
+    );
+
+    let sqlite = "pkg:generic/sqlite@3.46.1";
+    let manual = json!({
+        "bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+        "components": [{"type": "library", "name": "SQLite", "version": "3.46.1", "bom-ref": sqlite, "purl": sqlite}],
+    });
+    std::fs::write(
+        project.join("manual.cdx.json"),
+        serde_json::to_vec(&manual).unwrap(),
+    )
+    .unwrap();
+    lab.ok(&[
+        "sbom",
+        "--lvproj",
+        "Demo.lvproj",
+        "--include",
+        "manual.cdx.json",
+        "--output",
+        "project-with-manual.cdx.json",
+    ]);
+    let with_manual: Value =
+        serde_json::from_slice(&std::fs::read(project.join("project-with-manual.cdx.json")).unwrap())
+            .unwrap();
+    assert_eq!(&with_manual["metadata"]["component"], subject);
+    let manual_roots = dependency_row(&with_manual, &subject["bom-ref"]);
+    let sqlite_ref = json!(sqlite);
+    assert!(roots.iter().all(|reference| manual_roots.contains(reference)));
+    assert_eq!(manual_roots.len(), roots.len() + 1);
+    assert!(manual_roots.contains(&sqlite_ref));
+    assert_eq!(
+        with_manual["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|node| node["bom-ref"] == sqlite_ref)
+            .count(),
+        1
+    );
+    assert_eq!(std::fs::read(&raw).unwrap(), raw_bytes);
+
+    lab.fails(&["sbom", "--lvproj", "Demo.lvproj", "--output", "explicit.dll"]);
+    assert_eq!(std::fs::read(project.join("explicit.dll")).unwrap(), dll);
+}
+
+#[test]
+fn project_sbom_keeps_existing_output_when_a_required_source_is_missing() {
+    let lab = Lab::new("whole-project-missing-source");
+    let project = lab.project();
+    std::fs::write(project.join("present.lvlib"), b"<Library/>").unwrap();
+    std::fs::write(
+        project.join("Demo.lvproj"),
+        r#"<Project>
+  <Item Name="My Computer" Type="My Computer">
+    <Item Name="present.lvlib" Type="Library" URL="../present.lvlib"/>
+    <Item Name="missing.lvlib" Type="Library" URL="../missing.lvlib"/>
+  </Item>
+</Project>"#,
+    )
+    .unwrap();
+    let output = project.join("bom.cdx.json");
+    std::fs::write(&output, b"prior output").unwrap();
+    let strict = lab.fails(&[
+        "sbom",
+        "--lvproj",
+        "Demo.lvproj",
+        "--diagnostics-json",
+        "--output",
+        "bom.cdx.json",
+    ]);
+    has(&strict, "sbom.incomplete");
+    has(&strict, "missing.lvlib");
+    assert_eq!(std::fs::read(&output).unwrap(), b"prior output");
+
+    let partial_args = [
+        "sbom",
+        "--lvproj",
+        "Demo.lvproj",
+        "--allow-incomplete",
+        "--output",
+        "bom.cdx.json",
+    ];
+    lab.ok(&partial_args);
+    let partial = std::fs::read(&output).unwrap();
+    let bom: serde_json::Value = serde_json::from_slice(&partial).unwrap();
+    assert!(
+        bom["compositions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|scope| scope["aggregate"] == "incomplete")
+    );
+    let mut require_runtime = partial_args.to_vec();
+    require_runtime.push("--fail-on-incomplete=runtime");
+    lab.fails(&require_runtime);
+    assert_eq!(std::fs::read(output).unwrap(), partial);
+}
+
+#[test]
 fn distribution_sboms_include_only_configured_packed_library_sources() {
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};

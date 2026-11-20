@@ -6,12 +6,15 @@ use crate::nipkg::{self, PayloadInventory, PayloadReadKind};
 use crate::package_graph::ComponentId;
 use crate::ppl::{self, ARTIFACT_NAME_PROPERTY};
 use crate::project::Selection;
-use crate::sbom_artifacts::{ArtifactFile, has_extension};
+use crate::sbom_artifacts::{self, ArtifactFile, has_extension};
 use crate::sbom_metadata::{
     self, ARTIFACT_FILE, DIGEST_SUBJECT, portable_path_identity, purl_segment, vipm_purl,
 };
 use crate::version::Version;
-use crate::{sbom_artifact_document::PostBuild, sbom_ci, sbom_paths};
+use crate::{
+    sbom_artifact_document::{self, PostBuild},
+    sbom_ci, sbom_paths,
+};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -331,6 +334,51 @@ pub(crate) fn build_document(
     Ok(document)
 }
 
+pub(crate) fn project_document(
+    path: &Path,
+    environment: crate::vi_graph::Environment<'_>,
+    include: Option<&Path>,
+    allow_incomplete: bool,
+    vipm_database: Option<&Path>,
+    output: &sbom_paths::OutputGuard,
+) -> Result<(Value, Option<sbom_artifacts::Inventory>)> {
+    let name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .context("the LabVIEW project filename has no usable name")?;
+    let items = lvproj::read_project_items(path)?;
+    let graph = crate::vi_graph::scan_project(path, &items, environment)?;
+    graph.protect_inputs(output)?;
+    let packages = crate::package_graph::project(&graph, vipm_database, Some(output))?;
+    report_scan_issues(
+        graph.issues.iter().chain(&packages.issues),
+        allow_incomplete,
+        path,
+        "project",
+    )?;
+    let inventory = if graph.project_dlls.is_empty() {
+        None
+    } else {
+        Some(sbom_artifacts::scan_project_dlls(
+            &graph.project_dlls,
+            output,
+        )?)
+    };
+    let metadata = json!({
+        "component": {"type": "application", "bom-ref": PROJECT_REF, "name": name},
+        "properties": [
+            {"name": "lvpm:labview:scan-scope", "value": "project"},
+            {"name": "lvpm:labview:ownership-source", "value": "installed-file-ownership"}
+        ]
+    });
+    let mut document = vi_document(metadata, include, graph, packages, true)?;
+    if let Some(inventory) = &inventory {
+        sbom_artifact_document::add_project_dlls(&mut document, inventory)?;
+    }
+    Ok((document, inventory))
+}
+
 fn configured_build_document(
     build: lvproj::Build,
     path: &Path,
@@ -359,8 +407,15 @@ fn configured_build_document(
             graph.issues.iter().chain(&packages.issues),
             allow_incomplete,
             path,
+            "build",
         )?;
-        return vi_document(target, spec, &build, include, graph, packages);
+        return vi_document(
+            build_metadata(target, spec, &build),
+            include,
+            graph,
+            packages,
+            false,
+        );
     }
 
     let (packed_files, issues) = crate::distribution::packed_sources(path, target, &build)?;
@@ -378,7 +433,7 @@ fn configured_build_document(
         vipm_database.is_none(),
         "--vipm-database is only used for VI dependency scans"
     );
-    report_scan_issues(issues.iter(), allow_incomplete, path)?;
+    report_scan_issues(issues.iter(), allow_incomplete, path, "build")?;
     let mut document = if nipkg {
         nipkg_document(build, target, spec, include)?
     } else {
@@ -703,16 +758,7 @@ fn nipkg_import_path(importer: &str, import: &ppl::Import) -> Option<String> {
     Some(parts.join("/"))
 }
 
-fn vi_document(
-    target: &str,
-    spec: &str,
-    build: &lvproj::Build,
-    include: Option<&Path>,
-    mut graph: crate::vi_graph::Graph,
-    packages: crate::package_graph::PackageGraph,
-) -> Result<Value> {
-    graph.issues.extend(packages.issues);
-
+fn build_metadata(target: &str, spec: &str, build: &lvproj::Build) -> Value {
     let name = build.get("TgtF_productName").unwrap_or(spec);
     let mut subject = json!({
         "type": if build.kind == "EXE" { "application" } else { "library" },
@@ -744,15 +790,33 @@ fn vi_document(
     {
         subject["properties"] = json!([{"name": ARTIFACT_NAME_PROPERTY, "value": name}]);
     }
-    let mut properties = vec![
-        json!({"name": "lvpm:labview:target", "value": target}),
-        json!({"name": "lvpm:labview:build-spec", "value": spec}),
-        json!({"name": "lvpm:labview:build-type", "value": build.kind}),
+    json!({
+        "component": subject,
+        "properties": [
+            {"name": "lvpm:labview:target", "value": target},
+            {"name": "lvpm:labview:build-spec", "value": spec},
+            {"name": "lvpm:labview:build-type", "value": build.kind}
+        ]
+    })
+}
+
+fn vi_document(
+    mut metadata: Value,
+    include: Option<&Path>,
+    mut graph: crate::vi_graph::Graph,
+    packages: crate::package_graph::PackageGraph,
+    project_scope: bool,
+) -> Result<Value> {
+    graph.issues.extend(packages.issues);
+    let properties = metadata["properties"]
+        .as_array_mut()
+        .expect("VI scan metadata properties");
+    properties.extend([
         json!({"name": "lvpm:labview:dependency-source", "value": "static-vi-links-and-installed-file-ownership"}),
         json!({"name": "lvpm:labview:scan-environment", "value": if graph.venv.is_some() { "venv" } else { "labview-installation" }}),
         json!({"name": "lvpm:labview:scanned-files", "value": graph.files.len().to_string()}),
         json!({"name": "lvpm:labview:unowned-external-files", "value": packages.unowned_external.to_string()}),
-    ];
+    ]);
     for issue in &graph.issues {
         properties.push(json!({"name": "lvpm:labview:scan-issue", "value": issue}));
     }
@@ -784,7 +848,7 @@ fn vi_document(
         components.push(packed_component(
             &reference,
             packed,
-            graph.roots.contains(label),
+            !project_scope && graph.roots.contains(label),
         ));
         partial_assemblies.push(reference);
     }
@@ -799,19 +863,19 @@ fn vi_document(
         })
         .collect();
     let roots = packages.roots.iter().map(reference).collect();
-    let mut document = assemble(
-        json!({"component": subject, "properties": properties}),
-        components,
-        dependencies,
-        roots,
-        include,
-    )?;
+    let mut document = assemble(metadata, components, dependencies, roots, include)?;
     if !graph.issues.is_empty() {
         partial_assemblies.push(PROJECT_REF.to_owned());
     }
+    let mut compositions = Vec::new();
     if !partial_assemblies.is_empty() {
-        document["compositions"] =
-            json!([{"aggregate": "incomplete", "assemblies": partial_assemblies}]);
+        compositions.push(json!({"aggregate": "incomplete", "assemblies": partial_assemblies}));
+    }
+    if project_scope && graph.issues.is_empty() {
+        compositions.push(json!({"aggregate": "unknown", "assemblies": [PROJECT_REF]}));
+    }
+    if !compositions.is_empty() {
+        document["compositions"] = json!(compositions);
     }
     Ok(document)
 }
@@ -820,6 +884,7 @@ fn report_scan_issues<'a>(
     issues: impl Iterator<Item = &'a String>,
     allow_incomplete: bool,
     project: &Path,
+    scope: &str,
 ) -> Result<()> {
     if allow_incomplete {
         return Ok(());
@@ -838,7 +903,7 @@ fn report_scan_issues<'a>(
         sbom_ci::Failure::Incomplete,
         sbom_paths::diagnostic_path(project),
         format!(
-            "{} unresolved build scan issue(s); pass --allow-incomplete to export a partial graph:\n  {first}",
+            "{} unresolved {scope} scan issue(s); pass --allow-incomplete to export a partial graph:\n  {first}",
             issues.len()
         ),
     ))
@@ -858,7 +923,7 @@ fn add_packed_payload(
     if let Some(output) = output {
         graph.protect_inputs(output)?;
     }
-    report_scan_issues(graph.issues.iter(), allow_incomplete, project)?;
+    report_scan_issues(graph.issues.iter(), allow_incomplete, project, "build")?;
 
     let components = document["components"]
         .as_array_mut()

@@ -157,7 +157,7 @@ impl PostBuild<'_> {
         if !shipped.is_empty() {
             root.insert("components".to_owned(), json!(shipped));
         }
-        add_native_evidence(bom, &self.inventory.files, primary)?;
+        add_native_evidence(bom, &self.inventory.files, NativeScope::Output(primary))?;
         let file_inventory_complete = crate::sbom_installers::add_archive_evidence(
             bom,
             &self.inventory.files,
@@ -183,22 +183,72 @@ impl PostBuild<'_> {
     }
 }
 
+pub(crate) fn add_project_dlls(bom: &mut Value, inventory: &Inventory) -> Result<()> {
+    let root_ref = bom["metadata"]["component"]["bom-ref"]
+        .as_str()
+        .context("SBOM product has no bom-ref")?
+        .to_owned();
+    let components = bom["components"]
+        .as_array_mut()
+        .context("expected SBOM components")?;
+    let mut references = Vec::with_capacity(inventory.files.len());
+    for file in &inventory.files {
+        let reference = project_file_ref(file);
+        components.push(json!({
+            "type": "file",
+            "bom-ref": reference,
+            "name": file_name(&file.key),
+            "hashes": [sha256(file)],
+            "properties": [
+                {"name": "lvpm:labview:project-path", "value": file.key},
+                {"name": "lvpm:labview:byte-size", "value": file.size.to_string()},
+                {"name": "lvpm:digest:subject", "value": "project-file"},
+            ],
+        }));
+        references.push(Value::String(reference));
+    }
+    bom["dependencies"]
+        .as_array_mut()
+        .and_then(|rows| rows.iter_mut().find(|row| row["ref"] == root_ref))
+        .and_then(|row| row["dependsOn"].as_array_mut())
+        .context("expected SBOM product dependencies")?
+        .extend(references);
+    add_native_evidence(bom, &inventory.files, NativeScope::Project)
+}
+
+fn project_file_ref(file: &ArtifactFile) -> String {
+    format!("lvpm:labview:project-file:{}", file.key)
+}
+
+enum NativeScope<'a> {
+    Output(Option<&'a ArtifactFile>),
+    Project,
+}
+
 // Record native import evidence only against the files explicitly selected.
 fn add_native_evidence(
     bom: &mut Value,
     files: &[ArtifactFile],
-    primary: Option<&ArtifactFile>,
+    scope: NativeScope<'_>,
 ) -> Result<()> {
     let mut parsed = BTreeMap::new();
     for file in files
         .iter()
         .filter(|file| has_extension(&file.key, ".exe") || has_extension(&file.key, ".dll"))
     {
-        let component = if primary.is_some_and(|primary| primary.key == file.key) {
+        let is_primary =
+            matches!(scope, NativeScope::Output(Some(primary)) if primary.key == file.key);
+        let component = if is_primary {
             &mut bom["metadata"]["component"]
         } else {
-            let reference = file_ref(file);
-            bom["metadata"]["component"]["components"]
+            let (nodes, reference) = match scope {
+                NativeScope::Output(_) => (
+                    &mut bom["metadata"]["component"]["components"],
+                    file_ref(file),
+                ),
+                NativeScope::Project => (&mut bom["components"], project_file_ref(file)),
+            };
+            nodes
                 .as_array_mut()
                 .and_then(|nodes| nodes.iter_mut().find(|node| node["bom-ref"] == reference))
                 .context("selected native file is missing from the SBOM inventory")?
@@ -225,9 +275,7 @@ fn add_native_evidence(
                 );
                 if let Some(version) = &pe.file_version {
                     add_property(node, "lvpm:pe:file-version", json!(version));
-                    if primary.is_some_and(|primary| primary.key == file.key)
-                        && !node.contains_key("version")
-                    {
+                    if is_primary && !node.contains_key("version") {
                         node.insert("version".to_owned(), json!(version));
                         add_property(
                             node,
@@ -322,10 +370,16 @@ fn project_pe_imports(bom: &mut Value, parsed: &BTreeMap<&str, (String, Evidence
             );
         }
     }
-    bom["components"]
+    let components = bom["components"]
         .as_array_mut()
-        .expect("SBOM component array")
-        .extend(opaque.into_values());
+        .expect("SBOM component array");
+    for node in &mut *components {
+        add_import_observations(
+            node.as_object_mut().expect("SBOM component object"),
+            &mut observations,
+        );
+    }
+    components.extend(opaque.into_values());
     let rows = bom["dependencies"]
         .as_array_mut()
         .expect("SBOM dependency array");

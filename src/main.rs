@@ -154,19 +154,19 @@ struct SbomProjectArgs {
     /// Read direct packed-library references from a built .lvlibp.
     #[arg(long, value_name = "FILE", conflicts_with_all = ["nipkg", "lvproj", "with", "without", "only"])]
     lvlibp: Option<PathBuf>,
-    /// Read a build specification from a LabVIEW project.
-    #[arg(long, value_name = "FILE", requires_all = ["lvproj_target", "lvproj_build_spec"], conflicts_with_all = ["with", "without", "only"])]
+    /// Scan a saved LabVIEW project or a selected build specification.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["with", "without", "only"])]
     lvproj: Option<PathBuf>,
-    /// Select the exact target name in --lvproj.
-    #[arg(long, value_name = "NAME", requires = "lvproj")]
+    /// Select the exact target of --lvproj-build-spec.
+    #[arg(long, value_name = "NAME", requires_all = ["lvproj", "lvproj_build_spec"])]
     lvproj_target: Option<String>,
     /// Select the exact build specification name in the target.
-    #[arg(long, value_name = "NAME", requires = "lvproj")]
+    #[arg(long, value_name = "NAME", requires_all = ["lvproj", "lvproj_target"])]
     lvproj_build_spec: Option<String>,
     /// Export a partial VI dependency graph when files or links cannot be read.
     #[arg(long, requires = "lvproj")]
     allow_incomplete: bool,
-    /// Override the VIPM installation database used for file ownership in VI dependency scans.
+    /// Override the installed VIPM ownership database used in VI dependency scans.
     #[arg(long, value_name = "DIR", requires = "lvproj")]
     vipm_database: Option<PathBuf>,
     /// Select a delivered output file or directory. Repeat to select multiple outputs.
@@ -869,6 +869,14 @@ fn export_sbom(cli: &Cli, args: &SbomArgs) -> Result<()> {
     {
         guard.protect(path)?;
     }
+    if source.lvproj.is_some() && source.lvproj_build_spec.is_none() && !source.artifact.is_empty() {
+        return Err(sbom_ci::failure(
+            sbom_ci::Failure::Usage,
+            "arguments",
+            "--artifact with --lvproj requires a build specification",
+        ));
+    }
+
     let post_build = if let Some(first) = source.artifact.first() {
         let inventory = sbom_artifacts::scan(&source.artifact, source.artifact_root.as_deref(), &guard)
             .map_err(|error| sbom_ci::input_error(error, first))?;
@@ -887,6 +895,12 @@ fn export_sbom(cli: &Cli, args: &SbomArgs) -> Result<()> {
     } else {
         None
     };
+    let environment = vi_graph::Environment {
+        project: cli.project.as_deref(),
+        global: cli.global || cli.prefix.is_some(),
+        labview_version: cli.labview_version.as_deref(),
+    };
+    let mut project_inventory = None;
     let mut document = match (
         &source.lvlibp,
         &source.nipkg,
@@ -901,17 +915,26 @@ fn export_sbom(cli: &Cli, args: &SbomArgs) -> Result<()> {
         (_, _, Some(path), Some(target), Some(spec)) => {
             let options = sbom::ProjectBuildOptions {
                 include,
-                environment: vi_graph::Environment {
-                    project: cli.project.as_deref(),
-                    global: cli.global || cli.prefix.is_some(),
-                    labview_version: cli.labview_version.as_deref(),
-                },
+                environment,
                 allow_incomplete: source.allow_incomplete,
                 vipm_database: source.vipm_database.as_deref(),
                 output: Some(&guard),
             };
             sbom::build_document(path, target, spec, options, post_build.as_ref())
                 .map_err(|error| sbom_ci::input_error(error, path))?
+        }
+        (_, _, Some(path), None, None) => {
+            let (document, inventory) = sbom::project_document(
+                path,
+                environment,
+                include,
+                source.allow_incomplete,
+                source.vipm_database.as_deref(),
+                &guard,
+            )
+            .map_err(|error| sbom_ci::input_error(error, path))?;
+            project_inventory = inventory;
+            document
         }
         _ if let Some(post_build) = &post_build => sbom::artifact_document(post_build, include)
             .map_err(|error| sbom_ci::input_error(error, &source.artifact[0]))?,
@@ -923,7 +946,9 @@ fn export_sbom(cli: &Cli, args: &SbomArgs) -> Result<()> {
         &mut document,
         args.fail_on_incomplete,
         args.diagnostics_json,
-        post_build.as_ref().map(|post_build| &post_build.inventory),
+        project_inventory
+            .as_ref()
+            .or_else(|| post_build.as_ref().map(|post_build| &post_build.inventory)),
     )?;
     log!("wrote CycloneDX SBOM to {}", sbom_paths::diagnostic_path(output));
     Ok(())

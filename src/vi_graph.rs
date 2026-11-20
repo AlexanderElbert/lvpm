@@ -1,4 +1,4 @@
-//! Read-only traversal of the VI links rooted in a build specification.
+//! Read-only traversal of VI links from LabVIEW project sources.
 
 use crate::sbom_metadata::portable_path_identity;
 use crate::sbom_paths::redact_paths;
@@ -14,6 +14,7 @@ pub struct Graph {
     pub issues: BTreeSet<String>,
     pub files: BTreeMap<String, PathBuf>,
     pub packed: BTreeMap<String, PackedComponent>,
+    pub(crate) project_dlls: BTreeMap<String, PathBuf>,
     pub labview: Option<target::LvTarget>,
     pub venv: Option<venv::Venv>,
 }
@@ -26,6 +27,7 @@ impl Graph {
         let files = self
             .files
             .values()
+            .chain(self.project_dlls.values())
             .map(|path| llb_container(path).unwrap_or(path))
             .collect::<BTreeSet<_>>();
         for path in files {
@@ -42,7 +44,28 @@ pub struct Environment<'a> {
     pub labview_version: Option<&'a str>,
 }
 
+enum Sources<'a> {
+    Build(&'a lvproj::Build),
+    Project(&'a BTreeMap<String, lvproj::ProjectItem>),
+}
+
 pub fn scan(project: &Path, build: &lvproj::Build, environment: Environment<'_>) -> Result<Graph> {
+    scan_sources(project, Sources::Build(build), environment)
+}
+
+pub(crate) fn scan_project(
+    project: &Path,
+    items: &BTreeMap<String, lvproj::ProjectItem>,
+    environment: Environment<'_>,
+) -> Result<Graph> {
+    scan_sources(project, Sources::Project(items), environment)
+}
+
+fn scan_sources(
+    project: &Path,
+    sources: Sources<'_>,
+    environment: Environment<'_>,
+) -> Result<Graph> {
     let project = project.canonicalize()?;
     let project_dir = project
         .parent()
@@ -81,16 +104,28 @@ pub fn scan(project: &Path, build: &lvproj::Build, environment: Environment<'_>)
         addons: &addons,
     };
     let mut issues = BTreeSet::new();
-    let roots = build_roots(&project, build, &locations, &mut issues)?;
-    ensure!(
-        !roots.is_empty() || !issues.is_empty(),
-        "build has no selected VI or library sources"
-    );
+    let (roots, project_dlls, expand_nested_members) = match sources {
+        Sources::Build(build) => {
+            let roots = build_roots(&project, build, &locations, &mut issues)?;
+            ensure!(
+                !roots.is_empty() || !issues.is_empty(),
+                "build has no selected VI or library sources"
+            );
+            (
+                roots,
+                BTreeMap::new(),
+                build.kind == lvproj::PACKED_LIBRARY_TYPE,
+            )
+        }
+        Sources::Project(items) => {
+            let (roots, dlls) = project_roots(&project, items, &locations, &mut issues);
+            (roots, dlls, true)
+        }
+    };
 
     let mut edges = BTreeMap::new();
     let mut files = BTreeMap::new();
     let mut packed = PackedScan::default();
-    let packed_library = build.kind == lvproj::PACKED_LIBRARY_TYPE;
     let mut expanded = BTreeSet::new();
     let mut pending = roots
         .iter()
@@ -126,9 +161,9 @@ pub fn scan(project: &Path, build: &lvproj::Build, environment: Environment<'_>)
                 let child = locations.label(&resolved);
                 if child != label {
                     direct.insert(child);
-                    // A packed library's source members can own libraries
-                    // and classes of their own. Follow containment only.
-                    pending.push((resolved, packed_library && link.member));
+                    // Selected sources can own nested libraries and classes.
+                    // Follow containment for expansion of their members.
+                    pending.push((resolved, expand_nested_members && link.member));
                 }
             } else {
                 issues.insert(format!("{label} -> {}", locations.label(&link.path)));
@@ -146,6 +181,7 @@ pub fn scan(project: &Path, build: &lvproj::Build, environment: Environment<'_>)
             .collect(),
         files,
         packed: packed.components,
+        project_dlls,
         labview,
         venv,
     })
@@ -201,6 +237,7 @@ pub(crate) fn scan_packed_files(project: &Path, files: BTreeSet<PathBuf>) -> Res
         issues,
         files,
         packed: packed.components,
+        project_dlls: BTreeMap::new(),
         labview: None,
         venv: None,
     })
@@ -400,7 +437,18 @@ impl Locations<'_> {
             {
                 PathBuf::from(format!("{}:{}", &path[..1], &path[1..]))
             }
-            _ => base.join(url),
+            _ => {
+                // LabVIEW stores URLs relative to the referring file itself.
+                // Consume leading parents before opening the path so POSIX
+                // lookups do not try to traverse through that file.
+                let mut anchor = base;
+                let mut relative = Path::new(&url);
+                while let Ok(tail) = relative.strip_prefix("..") {
+                    anchor = anchor.parent().unwrap_or(anchor);
+                    relative = tail;
+                }
+                anchor.join(relative)
+            }
         };
         self.rebase(path)
     }
@@ -560,6 +608,71 @@ fn build_roots(
         }
     }
     Ok(roots)
+}
+
+fn project_roots(
+    project: &Path,
+    items: &BTreeMap<String, lvproj::ProjectItem>,
+    locations: &Locations<'_>,
+    issues: &mut BTreeSet<String>,
+) -> (BTreeSet<PathBuf>, BTreeMap<String, PathBuf>) {
+    let mut selected = BTreeSet::new();
+    for (name, item) in items {
+        let filename = Path::new(item.url.rsplit(['/', '\\']).next().unwrap_or_default());
+        if !item.is_directory && !is_project_source(filename) {
+            continue;
+        }
+        let path = match locations.url(project, &item.url) {
+            Ok(path) => path,
+            Err(error) => {
+                issues.insert(format!("project item {name:?}: {error:#}"));
+                continue;
+            }
+        };
+        if item.is_directory {
+            match linkfix::walk(&path) {
+                Ok(files) => selected.extend(files.into_iter().map(|(path, _)| path)),
+                Err(error) => {
+                    issues.insert(format!("project folder {name:?}: {error:#}"));
+                }
+            }
+        } else {
+            selected.insert(path);
+        }
+    }
+
+    let mut roots = BTreeSet::new();
+    let mut dlls = BTreeMap::new();
+    for path in selected {
+        if !is_project_source(&path) {
+            continue;
+        }
+        let dll = extension_is(&path, "dll");
+        let resolved = if dll {
+            path.canonicalize().ok().filter(|file| file.is_file())
+        } else {
+            resolve_file(&path)
+        };
+        match resolved {
+            Some(file) if dll => {
+                dlls.insert(locations.label(&file), file);
+            }
+            Some(file) => {
+                roots.insert(file);
+            }
+            None => {
+                issues.insert(format!(
+                    "project source {} is missing or unreadable",
+                    locations.label(&path)
+                ));
+            }
+        }
+    }
+    (roots, dlls)
+}
+
+fn is_project_source(path: &Path) -> bool {
+    is_labview_file(path) || extension_is(path, "dll")
 }
 
 fn is_under(item: &str, parent: &str) -> bool {
