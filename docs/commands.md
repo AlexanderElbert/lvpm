@@ -164,7 +164,7 @@ add the files that will ship.
 | EXE | Static VI graph, installed package ownership and referenced PPLs | Selected file hashes, primary EXE and PE import evidence |
 | Source Distribution (SRC) | Static VI graph, installed package ownership and referenced PPLs | Selected distribution file hashes |
 | Packed Project Library (PPL) | Static VI graph from the source library and included items, installed package ownership and referenced PPLs | Primary `.lvlibp` and selected file hashes. Use `--lvlibp` to export direct binary PPL references on their own. |
-| NI Package (NIPKG) | Configured NI requirements and available selected PPLs | Built control requirements, hashes for direct TAR members and supported PPL references. Saved declarations remain as metadata. |
+| NI Package (NIPKG) | Configured NI requirements, selected EXE and SRC dependency graphs, and available selected PPLs | Built control requirements, hashes for direct TAR members and supported PPL references. Saved declarations remain as metadata. |
 | Installer | Configured additional installers and selected PPLs | Selected file hashes and, on Windows, declared MSI product, file and feature metadata |
 | Shared Library (DLL) | Configured PPL selections when available | Primary DLL, selected file hashes and PE import evidence. Full shared-library source traversal is outside this mode. |
 | ZIP (LabVIEW `Zip File`) | Supported when configured PPL selections are recognized | Hashes for selected outputs. ZIP contents are outside the scan. |
@@ -288,14 +288,20 @@ lvpm sbom --lvproj TEMPLATE.lvproj --lvproj-target "My Computer" --lvproj-build-
 ```
 
 Select the exact target and build specification names. This mode reads the
-saved project XML and requires neither an `lvpm.toml` nor installed packages.
-It supports NIPKG build specifications. Required packages appear under the
+saved project XML and needs no `lvpm.toml`. Reading the NI requirement
+declarations needs no installed packages. Required packages appear under the
 product's `dependsOn`. Recommended and suggested packages are listed with
 their declared relationship. The version bounds stay in component properties
 and the dependency versions are omitted because no versions are resolved.
 The product version is the configured package version. The export also
-scans available PPL files selected for the package. It does not run
-automatic dependency selection or inspect the final package payload.
+scans available PPL files selected for the package. When the saved NIPKG
+selects an EXE or Source Distribution build specification as a source, the
+export attaches that build as a configured child and scans the source
+build's static VI dependencies. NI requirements stay on the package.
+VIP packages matched to files stay in the child build's graph.
+The scan can use `--vipm-database <DIR>` to override the default database.
+The resulting SBOM describes the package configuration. Use a built
+artifact for evidence of the final payload.
 
 To read the declared requirements and packed libraries of a built NI package:
 

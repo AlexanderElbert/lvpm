@@ -1269,6 +1269,129 @@ fn sbom_exports_explicit_nipkg_requirements_from_the_selected_build_spec() {
 }
 
 #[test]
+fn project_and_build_sboms_read_only_reached_packages_from_the_offline_vipm_database() {
+    use serde_json::{Value, json};
+
+    let lab = Lab::new("offline-vipm-sbom");
+    let project = lab.project();
+    let vi_lib = lab.root.join("labview/vi.lib");
+    for package in ["used-vip", "unrelated-vip"] {
+        let library = vi_lib.join(format!("{package}.lvlib"));
+        std::fs::write(&library, b"<Library/>").unwrap();
+        lab.package(package, "1.2.3.4", "");
+        let record = project.join("vipm-db").join(package);
+        std::fs::create_dir_all(&record).unwrap();
+        std::fs::write(
+            record.join("files-installed"),
+            format!("{}\n", library.canonicalize().unwrap().display()),
+        )
+        .unwrap();
+        let archive = format!("{package}-1.2.3.4.vip");
+        std::fs::copy(lab.root.join("packages").join(&archive), record.join(&archive)).unwrap();
+    }
+    std::fs::write(
+        project.join("application.lvlib"),
+        br#"<Library><Item Type="Library" URL="&lt;vilib&gt;/used-vip.lvlib"/></Library>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("test.lvproj"),
+        r#"<Project>
+  <Item Name="My Computer" Type="My Computer">
+    <Item Name="application.lvlib" Type="Library" URL="../application.lvlib"/>
+    <Item Name="Build Specifications" Type="Build">
+      <Item Name="Program" Type="EXE">
+        <Property Name="Source[0].itemID">/My Computer/application.lvlib</Property>
+        <Property Name="Source[0].sourceInclusion">TopLevel</Property>
+      </Item>
+      <Item Name="Source" Type="Source Distribution">
+        <Property Name="Source[0].itemID">/My Computer/application.lvlib</Property>
+        <Property Name="Source[0].sourceInclusion">Include</Property>
+      </Item>
+      <Item Name="NIPKG" Type="{E661DAE2-7517-431F-AC41-30807A3BDA38}">
+        <Property Name="PKG_packageName">example</Property>
+        <Property Name="PKG_version">1.0.0</Property>
+        <Property Name="PKG_dependencies.Count">1</Property>
+        <Property Name="PKG_dependencies[0].Package.Name">ni-runtime</Property>
+        <Property Name="PKG_dependencies[0].Relationship">Required Dependency</Property>
+        <Property Name="PKG_sources.Count">1</Property>
+        <Property Name="PKG_sources[0].ID">/My Computer/Build Specifications/Program</Property>
+        <Property Name="PKG_sources[0].Type">EXE Build</Property>
+      </Item>
+    </Item>
+  </Item>
+</Project>"#,
+    )
+    .unwrap();
+    let vip = json!("pkg:generic/vipm/used-vip@1.2.3.4");
+    let sqlite = json!("pkg:generic/sqlite@3.46.1");
+    let manual = json!({
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "version": 1,
+        "components": [
+            {"type": "library", "name": "SQLite", "version": "3.46.1", "bom-ref": sqlite, "purl": sqlite}
+        ]
+    });
+    std::fs::write(
+        project.join("manual.cdx.json"),
+        serde_json::to_vec(&manual).unwrap(),
+    )
+    .unwrap();
+
+    let export = |spec| -> Value {
+        let mut args = vec![
+            "sbom", "--lvproj", "test.lvproj", "--vipm-database", "vipm-db",
+            "--include", "manual.cdx.json", "--output", "scan.cdx.json",
+        ];
+        if let Some(spec) = spec {
+            args.extend(["--lvproj-target", "My Computer", "--lvproj-build-spec", spec]);
+        }
+        lab.ok(&args);
+        serde_json::from_slice(&std::fs::read(project.join("scan.cdx.json")).unwrap()).unwrap()
+    };
+    fn direct<'a>(bom: &'a Value, reference: &Value) -> &'a [Value] {
+        bom["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| &row["ref"] == reference)
+            .unwrap()["dependsOn"]
+            .as_array()
+            .unwrap()
+    }
+
+    for spec in [None, Some("Program"), Some("Source"), Some("NIPKG")] {
+        let bom = export(spec);
+        let product = &bom["metadata"]["component"];
+        let root = direct(&bom, &product["bom-ref"]);
+        let components = bom["components"].as_array().unwrap();
+        assert_eq!(components.iter().filter(|item| item["purl"] == vip).count(), 1);
+        assert_eq!(components.iter().filter(|item| item["purl"] == sqlite).count(), 1);
+        assert!(components.iter().all(|item| item["name"] != "unrelated-vip"));
+        assert_eq!(root.iter().filter(|item| *item == &sqlite).count(), 1);
+        if spec == Some("NIPKG") {
+            assert_eq!(product["name"], "example");
+            let child = components
+                .iter()
+                .chain(product["components"].as_array().into_iter().flatten())
+                .find(|item| item["name"] == "Program")
+                .unwrap();
+            assert!(child["properties"].as_array().unwrap().contains(
+                &json!({"name": "lvpm:nipkg:configured-source", "value": "true"})
+            ));
+            assert!(root.contains(&child["bom-ref"]));
+            assert!(root.contains(&json!("lvpm:nipkg:ni-runtime")));
+            assert_eq!(root.len(), 3);
+            assert_eq!(direct(&bom, &child["bom-ref"]), std::slice::from_ref(&vip));
+        } else {
+            assert_eq!(root.len(), 2);
+            assert!(root.contains(&vip));
+        }
+    }
+}
+
+#[test]
 fn a_venv_is_never_bound_to_a_labview_older_than_the_project() {
     let lab = Lab::new("older");
     std::fs::write(lab.manifest_path(), "[project]\nname = \"demo\"\nlabview = \"2100\"\n").unwrap();

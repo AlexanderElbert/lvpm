@@ -37,7 +37,7 @@ impl Graph {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct Environment<'a> {
     pub project: Option<&'a Path>,
     pub global: bool,

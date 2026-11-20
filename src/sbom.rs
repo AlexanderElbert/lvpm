@@ -398,27 +398,14 @@ fn configured_build_document(
         build.kind.as_str(),
         "EXE" | "Source Distribution" | lvproj::PACKED_LIBRARY_TYPE
     ) {
-        let graph = crate::vi_graph::scan(path, &build, environment)?;
-        if let Some(output) = output {
-            graph.protect_inputs(output)?;
-        }
-        let packages = crate::package_graph::project(&graph, vipm_database, output)?;
-        report_scan_issues(
-            graph.issues.iter().chain(&packages.issues),
-            allow_incomplete,
-            path,
-            "build",
-        )?;
-        return vi_document(
-            build_metadata(target, spec, &build),
-            include,
-            graph,
-            packages,
-            false,
-        );
+        return scan_build_document(path, &build, build_metadata(target, spec, &build), options);
     }
 
-    let (packed_files, issues) = crate::distribution::packed_sources(path, target, &build)?;
+    let crate::distribution::DistributionSources {
+        files: packed_files,
+        issues,
+        vi_builds,
+    } = crate::distribution::selected_sources(path, target, &build)?;
     let nipkg = build.kind.eq_ignore_ascii_case(lvproj::NIPKG_TYPE);
     ensure!(
         nipkg
@@ -430,7 +417,7 @@ fn configured_build_document(
         build.kind
     );
     ensure!(
-        vipm_database.is_none(),
+        vipm_database.is_none() || !vi_builds.is_empty(),
         "--vipm-database is only used for VI dependency scans"
     );
     report_scan_issues(issues.iter(), allow_incomplete, path, "build")?;
@@ -461,7 +448,50 @@ fn configured_build_document(
             compositions.push(incomplete);
         }
     }
-    Ok(document)
+    if vi_builds.is_empty() {
+        return Ok(document);
+    }
+
+    let children = vi_builds
+        .into_iter()
+        .map(|(spec, child)| {
+            let mut metadata = build_metadata(target, &spec, &child);
+            metadata["properties"]
+                .as_array_mut()
+                .expect("build metadata properties")
+                .push(json!({"name": "lvpm:nipkg:configured-source", "value": "true"}));
+            let child_options = ProjectBuildOptions {
+                include: None,
+                environment,
+                allow_incomplete,
+                vipm_database,
+                output,
+            };
+            scan_build_document(path, &child, metadata, child_options)
+                .with_context(|| format!("scanning configured NI package source {spec:?}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    crate::sbom_merge::merge_configured_builds(document, children)
+}
+
+fn scan_build_document(
+    path: &Path,
+    build: &lvproj::Build,
+    metadata: Value,
+    options: ProjectBuildOptions<'_>,
+) -> Result<Value> {
+    let graph = crate::vi_graph::scan(path, build, options.environment)?;
+    if let Some(output) = options.output {
+        graph.protect_inputs(output)?;
+    }
+    let packages = crate::package_graph::project(&graph, options.vipm_database, options.output)?;
+    report_scan_issues(
+        graph.issues.iter().chain(&packages.issues),
+        options.allow_incomplete,
+        path,
+        "build",
+    )?;
+    vi_document(metadata, options.include, graph, packages, false)
 }
 
 fn distribution_document(

@@ -149,6 +149,16 @@ pub fn merge(primary: &Path, children: &[PathBuf]) -> Result<Value> {
     render(primary)
 }
 
+/// Attach the VI dependency graphs of saved build specifications selected by
+/// a package. There is no byte-level containment evidence for these inputs.
+pub(crate) fn merge_configured_builds(primary: Value, children: Vec<Value>) -> Result<Value> {
+    let mut primary = parse(primary)?;
+    for child in children {
+        merge_child(&mut primary, parse(child)?, ChildMerge::ConfiguredBuild)?;
+    }
+    render(primary)
+}
+
 /// Merge BOMs and apply the caller's direct containment and dependency evidence.
 pub(crate) fn merge_with_relationships(
     primary: &Path,
@@ -177,7 +187,7 @@ pub(crate) fn merge_with_relationships(
         let path = &paths[alias];
         let child =
             read(path).with_context(|| format!("reading child SBOM {}", diagnostic_path(path)))?;
-        let root = merge_child(&mut primary, child, false)
+        let root = merge_child(&mut primary, child, ChildMerge::Relationship)
             .map_err(|error| crate::sbom_ci::input_error(error, path))?;
         roots.insert(alias, root);
     }
@@ -340,10 +350,17 @@ fn add_requirement(bom: &mut Bom, parent: &str, child: &str) {
 }
 
 fn merge_boms(primary: &mut Bom, child: Bom) -> Result<String> {
-    merge_child(primary, child, true)
+    merge_child(primary, child, ChildMerge::Dependency)
 }
 
-fn merge_child(primary: &mut Bom, mut child: Bom, legacy: bool) -> Result<String> {
+enum ChildMerge {
+    Dependency,
+    Relationship,
+    ConfiguredBuild,
+}
+
+fn merge_child(primary: &mut Bom, mut child: Bom, mode: ChildMerge) -> Result<String> {
+    let legacy = !matches!(mode, ChildMerge::Relationship);
     if let Some(existing) = verified_source_product(primary, &child)? {
         if legacy && artifact_name(&child.nodes[&child.root])?.is_none() && existing != primary.root
         {
@@ -385,6 +402,7 @@ fn merge_child(primary: &mut Bom, mut child: Bom, legacy: bool) -> Result<String
         }
     }
     let matched_ppl = marked_ppl && artifact_targets.contains_key(&child.root);
+    let shared_scan_counts = matched_ppl || matches!(mode, ChildMerge::ConfiguredBuild);
 
     let child_refs: BTreeSet<_> = child.nodes.keys().cloned().collect();
     let in_use = reserved_refs(primary);
@@ -404,7 +422,7 @@ fn merge_child(primary: &mut Bom, mut child: Bom, legacy: bool) -> Result<String
             ensure!(
                 original != child.root
                     && reference != &primary.root
-                    && same_component(&primary.nodes[reference], &component, matched_ppl),
+                    && same_component(&primary.nodes[reference], &component, shared_scan_counts),
                 "conflicting components with PURL {}",
                 component["purl"]
             );
@@ -1112,11 +1130,11 @@ fn license_declaration(entry: &Value) -> Result<(&'static str, &str)> {
     Ok(("name", string_field(license, "name")?.trim()))
 }
 
-fn same_component(primary: &Value, incoming: &Value, match_ppl: bool) -> bool {
+fn same_component(primary: &Value, incoming: &Value, allow_scan_count_difference: bool) -> bool {
     if primary == incoming {
         return true;
     }
-    if !match_ppl {
+    if !allow_scan_count_difference {
         return false;
     }
     // The same package can contribute a different number of VIs to each
@@ -1622,7 +1640,7 @@ mod tests {
         };
 
         assert_eq!(
-            merge_child(&mut primary, child(), false).unwrap(),
+            merge_child(&mut primary, child(), ChildMerge::Relationship).unwrap(),
             "shipped"
         );
         assert_eq!(primary.nodes["shipped"]["supplier"], supplier);
@@ -1636,7 +1654,7 @@ mod tests {
         let first = render(primary).unwrap();
         let mut repeated = parse(first.clone()).unwrap();
         assert_eq!(
-            merge_child(&mut repeated, child(), false).unwrap(),
+            merge_child(&mut repeated, child(), ChildMerge::Relationship).unwrap(),
             "shipped"
         );
         assert_eq!(render(repeated).unwrap(), first);
@@ -1646,7 +1664,12 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("supplier");
-        let error = merge_child(&mut parse(stale).unwrap(), child(), false).unwrap_err();
+        let error = merge_child(
+            &mut parse(stale).unwrap(),
+            child(),
+            ChildMerge::Relationship,
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("lost its supplier declaration"));
     }
 
@@ -1996,9 +2019,10 @@ mod tests {
             "serialNumber": "urn:uuid:7874bd20-29a1-4140-81d1-c81480b1a623",
             "metadata": {"timestamp": "2026-11-20T12:00:00Z"}
         }));
-        let app_ref = merge_child(&mut combined, child, false).unwrap();
+        let app_ref = merge_child(&mut combined, child, ChildMerge::Relationship).unwrap();
         assert_eq!(app_ref, "installed-app");
-        let ppl_ref = merge_child(&mut combined, parse(ppl).unwrap(), false).unwrap();
+        let ppl_ref =
+            merge_child(&mut combined, parse(ppl).unwrap(), ChildMerge::Relationship).unwrap();
         let relations: Plan = serde_json::from_value(json!({
             "children": {"app": "app.cdx.json", "add-on": "ppl.cdx.json"},
             "relationships": [
@@ -2170,7 +2194,7 @@ mod tests {
             "metadata": {"component": distinct}
         }))
         .unwrap();
-        let incoming = merge_child(&mut primary, child, false).unwrap();
+        let incoming = merge_child(&mut primary, child, ChildMerge::Relationship).unwrap();
         assert_eq!(incoming, "input");
         assert_eq!(primary.nodes["input"]["version"], "2.0.0");
         assert_eq!(primary.nodes["original"]["version"], "1.0.0");

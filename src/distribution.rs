@@ -1,30 +1,35 @@
-//! Discover explicitly selected packed libraries in file-based build specifications.
+//! Discover selected LabVIEW sources in file-based build specifications.
 
 use crate::{linkfix, lvproj};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-/// Existing PPL inputs and diagnostics for selected files that could not be located.
-pub(crate) fn packed_sources(
+/// Selected PPL files, referenced VI builds, and unresolved-source diagnostics.
+#[derive(Default)]
+pub(crate) struct DistributionSources {
+    pub(crate) files: BTreeSet<PathBuf>,
+    pub(crate) issues: BTreeSet<String>,
+    pub(crate) vi_builds: BTreeMap<String, lvproj::Build>,
+}
+
+pub(crate) fn selected_sources(
     project: &Path,
     target: &str,
     build: &lvproj::Build,
-) -> Result<(BTreeSet<PathBuf>, BTreeSet<String>)> {
+) -> Result<DistributionSources> {
     let mut sources = Sources {
         project: project.canonicalize()?,
-        files: BTreeSet::new(),
-        issues: BTreeSet::new(),
+        result: DistributionSources::default(),
         visited: BTreeSet::new(),
     };
     sources.build(target, build)?;
-    Ok((sources.files, sources.issues))
+    Ok(sources.result)
 }
 
 struct Sources {
     project: PathBuf,
-    files: BTreeSet<PathBuf>,
-    issues: BTreeSet<String>,
+    result: DistributionSources,
     visited: BTreeSet<(String, String)>,
 }
 
@@ -102,6 +107,9 @@ impl Sources {
         else {
             return Ok(());
         };
+        if selected.is_none() && self.result.vi_builds.contains_key(spec) {
+            return Ok(());
+        }
         let build = lvproj::read_build(&self.project, target, spec)
             .with_context(|| format!("reading referenced build {reference:?}"))?;
         if let Some(selected) = selected
@@ -112,6 +120,10 @@ impl Sources {
             }
         } else if build.kind == lvproj::PACKED_LIBRARY_TYPE {
             self.packed_output(&build, reference);
+        } else if selected.is_none() && matches!(build.kind.as_str(), "EXE" | "Source Distribution")
+        {
+            // The VI scanner handles the full graph, including selected PPLs.
+            self.result.vi_builds.insert(spec.to_owned(), build);
         } else if selected.is_none() && self.visited.insert((target.to_owned(), spec.to_owned())) {
             self.build(target, &build)?;
         }
@@ -228,9 +240,9 @@ impl Sources {
         let label = format!("{reference}/{name}");
         match files.len() {
             0 => self.add_ppl(None, &label),
-            1 => self.files.extend(files),
+            1 => self.result.files.extend(files),
             _ => {
-                self.issues.insert(format!(
+                self.result.issues.insert(format!(
                     "packed project library source {label:?} matches several build outputs"
                 ));
             }
@@ -259,9 +271,9 @@ impl Sources {
             .filter(|path| is_ppl(path) && path.is_file())
             .and_then(|path| path.canonicalize().ok())
         {
-            self.files.insert(path);
+            self.result.files.insert(path);
         } else {
-            self.issues.insert(format!(
+            self.result.issues.insert(format!(
                 "packed project library source {label:?} is missing"
             ));
         }
