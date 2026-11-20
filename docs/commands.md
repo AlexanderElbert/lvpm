@@ -137,7 +137,10 @@ The product name comes from the project filename. The scan matches files
 against lvpm installation records and, on Windows, the selected LabVIEW
 installation's VIPM database when present. It reads the database directly
 from disk. Use `--vipm-database <DIR>` to override the database. Unowned
-external files are counted in the SBOM. This mode needs no project manifest.
+external files are counted in the SBOM. The scan follows the installed
+requirements of the packages it reaches, as described under
+[Scan static VI dependencies](#scan-static-vi-dependencies).
+This mode needs no project manifest.
 
 The scan reads recorded imports from available PPLs. Explicit DLL items
 and DLLs under declared physical folders include a file hash and available
@@ -298,7 +301,8 @@ scans available PPL files selected for the package. When the saved NIPKG
 selects an EXE or Source Distribution build specification as a source, the
 export attaches that build as a configured child and scans the source
 build's static VI dependencies. NI requirements stay on the package.
-VIP packages matched to files stay in the child build's graph.
+VIP packages matched to files and their installed package requirements
+stay in the child build's graph.
 The scan can use `--vipm-database <DIR>` to override the default database.
 The resulting SBOM describes the package configuration. Use a built
 artifact for evidence of the final payload.
@@ -372,8 +376,10 @@ distribution paths need additional resolution.
 
 For EXE, Source Distribution and Packed Project Library, the scan follows subVIs
 starting from the top-level and explicitly included build sources. It follows links inside verified
-embedded VI instances in the caller's VINS resources. From a venv, or with
-`--project <DIR>`, the scan uses the LabVIEW version bound to that venv. Its
+embedded VI instances in the caller's VINS resources. Class API references
+also lead to the referenced class's saved non-static method VIs. From a
+venv, or with `--project <DIR>`, the scan uses the LabVIEW version bound to
+that venv. Its
 installed addons supply library files that are absent from the bound LabVIEW
 installation. If both have the same file, LabVIEW loads its installed copy.
 The scan uses the same order. Use `--global`
@@ -385,14 +391,31 @@ the active venv's records and the base installation's records. On Windows,
 it also reads the matching VIPM database when present. Use
 `--vipm-database <DIR>` to supply a different database. The offline reader
 uses the absolute paths in each package's `files-installed` list and reads
-the package version and metadata from its archived spec. Each package
-appears once per version, with the number of matched files. The graph
-follows links through unowned files to reach package dependencies.
-Unowned external files are counted in metadata. The scan does not infer
-arbitrary dynamic loads or the final set of files in the built artifact.
+the package version, metadata and `Requires` from its archived spec. The
+graph follows VI links through unowned files to identify package owners,
+then walks the installed package requirements transitively. For packages
+installed by lvpm, it uses the dependency names saved in the installation
+records. Archived specs can list package names alone or supply a version
+comparison using `>=`, `<=`, `>`, `<`, `=` or `==`. Separate entries with a
+comma or semicolon. Each selected installed copy must satisfy all comparisons
+for that dependency from the requiring package.
 
-The scan fails if it encounters unresolved links, unreadable files or
-ambiguous package ownership.
+Each package appears once per version, with a count of its matched files.
+A package reached only through declared requirements has a count of zero.
+If several configured NIPKG sources share a package, the reported count is
+the largest found in any one source scan.
+The requiring component records each resolved declaration in a
+`lvpm:package:requires` property. A lone `>=` comparison appears as `minimum`.
+Other comparisons or combinations appear in `constraints` with their operators
+and required versions. The dependency graph retains both the observed VI links
+and these declared package dependencies. A package
+declaration can include development tools and examples. Use the built
+artifact's file inventory to establish what ships. Unowned external
+files are counted in metadata. Arbitrary dynamic loads remain outside
+the scan.
+
+Unresolved links, unreadable files, ambiguous package ownership and
+unsatisfied package requirements fail the scan.
 `--allow-incomplete` writes the resolved graph with an incomplete
 composition and scan diagnostics in metadata. This mode reads project
 files and the selected installation without launching LabVIEW or building

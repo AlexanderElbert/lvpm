@@ -864,11 +864,36 @@ fn vi_document(
                 &scanned_package_ref(&id.0, &id.1),
                 package.metadata.as_ref(),
             );
+            let fields = component.as_object_mut().expect("package component");
             crate::sbom_artifact_document::add_property(
-                component.as_object_mut().expect("package component"),
+                fields,
                 "lvpm:labview:matched-files",
                 json!(package.matched_files.to_string()),
             );
+            for ((name, version), constraints) in &package.required {
+                let mut requirement = json!({"name": name, "version": version});
+                if let Some(minimum) = constraints.first()
+                    && constraints.len() == 1
+                    && minimum.operator == ">="
+                {
+                    requirement["minimum"] = json!(minimum.version.raw);
+                } else if !constraints.is_empty() {
+                    requirement["constraints"] = json!(
+                        constraints
+                            .iter()
+                            .map(|constraint| json!({
+                                "operator": constraint.operator,
+                                "version": constraint.version.raw,
+                            }))
+                            .collect::<Vec<_>>()
+                    );
+                }
+                crate::sbom_artifact_document::add_property(
+                    fields,
+                    "lvpm:package:requires",
+                    json!(requirement.to_string()),
+                );
+            }
             component
         })
         .collect();

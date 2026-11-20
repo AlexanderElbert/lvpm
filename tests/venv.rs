@@ -1268,26 +1268,37 @@ fn sbom_exports_explicit_nipkg_requirements_from_the_selected_build_spec() {
     assert_eq!(std::fs::read(output).unwrap(), bytes);
 }
 
+fn add_offline_vip(lab: &Lab, name: &str, requires: &str, installed_file: &Path) {
+    let version = "1.2.3.4";
+    lab.package(name, version, requires);
+    let record = lab.project().join("vipm-db").join(name);
+    std::fs::create_dir_all(&record).unwrap();
+    std::fs::write(
+        record.join("files-installed"),
+        format!("{}\n", installed_file.canonicalize().unwrap().display()),
+    )
+    .unwrap();
+    let archive = format!("{name}-{version}.vip");
+    std::fs::copy(lab.root.join("packages").join(&archive), record.join(&archive)).unwrap();
+}
+
 #[test]
-fn project_and_build_sboms_read_only_reached_packages_from_the_offline_vipm_database() {
+fn project_and_build_sboms_resolve_transitive_requirements_from_the_offline_vipm_database() {
     use serde_json::{Value, json};
 
     let lab = Lab::new("offline-vipm-sbom");
     let project = lab.project();
     let vi_lib = lab.root.join("labview/vi.lib");
-    for package in ["used-vip", "unrelated-vip"] {
+    for (package, requires) in [
+        ("used-vip", "bridge-vip>=1.2.0.0"),
+        ("bridge-vip", "leaf-vip>=1.2.3.0,leaf-vip=1.2.3.4"),
+        ("leaf-vip", ""),
+        // A bad requirement in an unrelated package has no effect on this SBOM.
+        ("unrelated-vip", "uninstalled-vip>=8.0.0.0"),
+    ] {
         let library = vi_lib.join(format!("{package}.lvlib"));
         std::fs::write(&library, b"<Library/>").unwrap();
-        lab.package(package, "1.2.3.4", "");
-        let record = project.join("vipm-db").join(package);
-        std::fs::create_dir_all(&record).unwrap();
-        std::fs::write(
-            record.join("files-installed"),
-            format!("{}\n", library.canonicalize().unwrap().display()),
-        )
-        .unwrap();
-        let archive = format!("{package}-1.2.3.4.vip");
-        std::fs::copy(lab.root.join("packages").join(&archive), record.join(&archive)).unwrap();
+        add_offline_vip(&lab, package, requires, &library);
     }
     std::fs::write(
         project.join("application.lvlib"),
@@ -1324,6 +1335,8 @@ fn project_and_build_sboms_read_only_reached_packages_from_the_offline_vipm_data
     )
     .unwrap();
     let vip = json!("pkg:generic/vipm/used-vip@1.2.3.4");
+    let bridge = json!("pkg:generic/vipm/bridge-vip@1.2.3.4");
+    let leaf = json!("pkg:generic/vipm/leaf-vip@1.2.3.4");
     let sqlite = json!("pkg:generic/sqlite@3.46.1");
     let manual = json!({
         "bomFormat": "CycloneDX",
@@ -1361,15 +1374,57 @@ fn project_and_build_sboms_read_only_reached_packages_from_the_offline_vipm_data
             .unwrap()
     }
 
+    fn component<'a>(items: &'a [Value], purl: &Value) -> &'a Value {
+        let mut matching = items.iter().filter(|item| &item["purl"] == purl);
+        let item = matching.next().expect("expected exactly one component");
+        assert!(matching.next().is_none());
+        item
+    }
+
+    fn property<'a>(component: &'a Value, name: &str) -> &'a str {
+        component["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|property| property["name"] == name)
+            .unwrap()["value"]
+            .as_str()
+            .unwrap()
+    }
+
     for spec in [None, Some("Program"), Some("Source"), Some("NIPKG")] {
         let bom = export(spec);
         let product = &bom["metadata"]["component"];
         let root = direct(&bom, &product["bom-ref"]);
         let components = bom["components"].as_array().unwrap();
-        assert_eq!(components.iter().filter(|item| item["purl"] == vip).count(), 1);
-        assert_eq!(components.iter().filter(|item| item["purl"] == sqlite).count(), 1);
+        let used = component(components, &vip);
+        let bridge_package = component(components, &bridge);
+        let leaf_package = component(components, &leaf);
+        component(components, &sqlite);
         assert!(components.iter().all(|item| item["name"] != "unrelated-vip"));
         assert_eq!(root.iter().filter(|item| *item == &sqlite).count(), 1);
+        assert_eq!(direct(&bom, &vip), std::slice::from_ref(&bridge));
+        assert_eq!(direct(&bom, &bridge), std::slice::from_ref(&leaf));
+        assert_eq!(property(bridge_package, "lvpm:labview:matched-files"), "0");
+        assert_eq!(property(leaf_package, "lvpm:labview:matched-files"), "0");
+        let decode_requires = |component: &Value| {
+            serde_json::from_str::<Value>(property(component, "lvpm:package:requires")).unwrap()
+        };
+        assert_eq!(
+            decode_requires(used),
+            json!({"name":"bridge-vip","version":"1.2.3.4","minimum":"1.2.0.0"}),
+        );
+        assert_eq!(
+            decode_requires(bridge_package),
+            json!({
+                "name": "leaf-vip",
+                "version": "1.2.3.4",
+                "constraints": [
+                    {"operator": "=", "version": "1.2.3.4"},
+                    {"operator": ">=", "version": "1.2.3.0"}
+                ]
+            }),
+        );
         if spec == Some("NIPKG") {
             assert_eq!(product["name"], "example");
             let child = components
@@ -1389,6 +1444,117 @@ fn project_and_build_sboms_read_only_reached_packages_from_the_offline_vipm_data
             assert!(root.contains(&vip));
         }
     }
+
+    let output = project.join("scan.cdx.json");
+    let previous = std::fs::read(&output).unwrap();
+    let args = [
+        "sbom", "--lvproj", "test.lvproj", "--vipm-database", "vipm-db",
+        "--diagnostics-json", "--output", "scan.cdx.json",
+    ];
+    for (requirement, diagnostic) in [
+        ("leaf-vip>=2.0.0.0", "leaf-vip>=2.0.0.0"),
+        ("leaf-vip!=1.2.3.4", "invalid package requirement"),
+        ("leaf-vip=1.2.3.0", "leaf-vip=1.2.3.0"),
+    ] {
+        add_offline_vip(
+            &lab,
+            "bridge-vip",
+            requirement,
+            &vi_lib.join("bridge-vip.lvlib"),
+        );
+        let failed = lab.fails(&args);
+        has(&failed, "sbom.incomplete");
+        has(&failed, "leaf-vip");
+        has(&failed, diagnostic);
+        assert_eq!(std::fs::read(&output).unwrap(), previous);
+    }
+
+    let mut partial_args = args.to_vec();
+    partial_args.push("--allow-incomplete");
+    let partial = lab.ok(&partial_args);
+    has(&partial, "leaf-vip");
+    let bom: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert!(!bom["components"].as_array().unwrap().iter().any(|item| item["purl"] == leaf));
+    assert!(!bom["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["ref"] == bridge && row["dependsOn"].as_array().is_some_and(|deps| deps.contains(&leaf))));
+}
+
+#[test]
+fn project_sbom_follows_dispatch_methods_of_a_class_reached_from_a_binary_vi() {
+    let lab = Lab::new("sbom-dispatch-class");
+    let project = lab.project();
+    let vi_lib = lab.root.join("labview/vi.lib");
+    let backend = vi_lib.join("backend");
+    std::fs::create_dir(&backend).unwrap();
+    let driver = vi_lib.join("driver-vip.lvlib");
+    std::fs::write(&driver, b"<Library/>").unwrap();
+    add_offline_vip(&lab, "driver-vip", "", &driver);
+
+    std::fs::write(
+        project.join("entry.vi"),
+        token_link_fixture(b"VIPI", &[b"<vilib>", b"backend", b"SQLite.lvclass"]),
+    )
+    .unwrap();
+    std::fs::write(
+        backend.join("Connect.vi"),
+        token_link_fixture(b"VIVI", &[b"<vilib>", b"driver-vip.lvlib"]),
+    )
+    .unwrap();
+    std::fs::write(
+        backend.join("SQLite.lvclass"),
+        br#"<Library>
+  <Item Name="Parent.lvclass" Type="Parent" URL="../Parent.lvclass"/>
+  <Item Name="Connect.vi" Type="VI" URL="../Connect.vi">
+    <Property Name="NI.ClassItem.IsStaticMethod" Type="Bool">false</Property>
+  </Item>
+  <Item Name="Optional.vi" Type="VI" URL="../Optional.vi">
+    <Property Name="NI.ClassItem.IsStaticMethod" Type="Bool">true</Property>
+  </Item>
+</Library>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        backend.join("Parent.lvclass"),
+        br#"<Library>
+  <Item Name="Unselected.vi" Type="VI" URL="../Unselected.vi">
+    <Property Name="NI.ClassItem.IsStaticMethod" Type="Bool">false</Property>
+  </Item>
+</Library>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("test.lvproj"),
+        br#"<Project><Item Name="My Computer" Type="My Computer">
+  <Item Name="entry.vi" Type="VI" URL="../entry.vi"/>
+</Item></Project>"#,
+    )
+    .unwrap();
+
+    lab.ok(&[
+        "sbom",
+        "--lvproj",
+        "test.lvproj",
+        "--vipm-database",
+        "vipm-db",
+        "--output",
+        "scan.cdx.json",
+    ]);
+    let bom: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(project.join("scan.cdx.json")).unwrap()).unwrap();
+    let vip = "pkg:generic/vipm/driver-vip@1.2.3.4";
+    let components = bom["components"].as_array().unwrap();
+    assert_eq!(components.len(), 1);
+    assert_eq!(components[0]["purl"], vip);
+    assert!(components[0]["properties"].as_array().unwrap().contains(
+        &serde_json::json!({"name": "lvpm:labview:matched-files", "value": "1"})
+    ));
+    let root = &bom["metadata"]["component"]["bom-ref"];
+    let row = bom["dependencies"].as_array().unwrap().iter()
+        .find(|row| &row["ref"] == root).unwrap();
+    assert_eq!(row["dependsOn"], serde_json::json!([vip]));
 }
 
 #[test]
@@ -1675,34 +1841,53 @@ fn an_unreadable_record_of_another_package_does_not_stop_an_install() {
 
 /// A synthetic VI with two stored help-directory links. Only Known.vi exists.
 fn help_link_fixture(qualify_known: bool) -> Vec<u8> {
+    let mut links = b"\0\x01LVIN\0\0\0\x02".to_vec();
+    let known: &[&[u8]] = if qualify_known {
+        &[b"Known.lvlib", b"Known.vi"]
+    } else {
+        &[b"Known.vi"]
+    };
+    append_token_link(&mut links, b"VIVI", known, &[b"<helpdir>", b"help-links", b"Known.vi"]);
+    append_token_link(
+        &mut links, b"VIVI", &[b"Missing.vi"], &[b"<helpdir>", b"help-links", b"Missing.vi"],
+    );
+    link_resource(links)
+}
+
+fn token_link_fixture(ident: &[u8; 4], path: &[&[u8]]) -> Vec<u8> {
+    let mut links = b"\0\x01LVIN\0\0\0\x01".to_vec();
+    append_token_link(&mut links, ident, &path[path.len() - 1..], path);
+    link_resource(links)
+}
+
+fn append_token_link(links: &mut Vec<u8>, ident: &[u8; 4], qualifiers: &[&[u8]], path: &[&[u8]]) {
     fn push_name(output: &mut Vec<u8>, name: &[u8]) {
         output.push(name.len() as u8);
         output.extend_from_slice(name);
     }
 
-    let mut links = b"\0\x01LVIN\0\0\0\x02".to_vec();
-    for (file, qualify) in [(b"Known.vi".as_slice(), qualify_known), (b"Missing.vi", false)] {
-        links.extend_from_slice(b"\0\x02VIVI");
-        links.resize(links.len().next_multiple_of(4), 0);
-        links.extend_from_slice(&(1 + u32::from(qualify)).to_be_bytes());
-        if qualify {
-            push_name(&mut links, b"Known.lvlib");
-        }
-        push_name(&mut links, file);
-        links.resize(links.len().next_multiple_of(2), 0);
-
-        let components = [b"<helpdir>".as_slice(), b"help-links", file];
-        let length = 4 + components.iter().map(|name| 1 + name.len()).sum::<usize>();
-        links.extend_from_slice(b"PTH0");
-        links.extend_from_slice(&(length as u32).to_be_bytes());
-        links.extend_from_slice(b"\0\0\0\x03");
-        for component in components {
-            push_name(&mut links, component);
-        }
-        links.extend_from_slice(&[0; 4]);
+    links.extend_from_slice(b"\0\x02");
+    links.extend_from_slice(ident);
+    links.resize(links.len().next_multiple_of(4), 0);
+    links.extend_from_slice(&(qualifiers.len() as u32).to_be_bytes());
+    for qualifier in qualifiers {
+        push_name(links, qualifier);
     }
-    links.extend_from_slice(b"\0\x03");
+    links.resize(links.len().next_multiple_of(2), 0);
 
+    let length = 4 + path.iter().map(|name| 1 + name.len()).sum::<usize>();
+    links.extend_from_slice(b"PTH0");
+    links.extend_from_slice(&(length as u32).to_be_bytes());
+    links.extend_from_slice(&0u16.to_be_bytes());
+    links.extend_from_slice(&(path.len() as u16).to_be_bytes());
+    for component in path {
+        push_name(links, component);
+    }
+    links.extend_from_slice(&[0; 4]);
+}
+
+fn link_resource(mut links: Vec<u8>) -> Vec<u8> {
+    links.extend_from_slice(b"\0\x03");
     // RSRC data and block-info tables for the saved-version and VI link blocks.
     let sections = [(b"LVSR", [0x20, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0].as_slice()),
                     (b"LIvi", links.as_slice())];

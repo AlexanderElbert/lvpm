@@ -5,7 +5,7 @@ use crate::sbom_paths::{OutputGuard, diagnostic_path};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::path::{Path, PathBuf};
 
 type Edges = BTreeMap<String, Option<BTreeSet<String>>>;
@@ -402,7 +402,8 @@ fn merge_child(primary: &mut Bom, mut child: Bom, mode: ChildMerge) -> Result<St
         }
     }
     let matched_ppl = marked_ppl && artifact_targets.contains_key(&child.root);
-    let shared_scan_counts = matched_ppl || matches!(mode, ChildMerge::ConfiguredBuild);
+    let configured_build = matches!(mode, ChildMerge::ConfiguredBuild);
+    let shared_scan_counts = matched_ppl || configured_build;
 
     let child_refs: BTreeSet<_> = child.nodes.keys().cloned().collect();
     let in_use = reserved_refs(primary);
@@ -467,7 +468,17 @@ fn merge_child(primary: &mut Bom, mut child: Bom, mode: ChildMerge) -> Result<St
                 .entry(purl.to_owned())
                 .or_insert_with(|| reference.clone());
         }
-        primary.nodes.entry(reference.clone()).or_insert(component);
+        match primary.nodes.entry(reference.clone()) {
+            Entry::Occupied(mut entry)
+                if configured_build
+                    && matched_file_count(&component) > matched_file_count(entry.get()) =>
+            {
+                entry.insert(component);
+            }
+            entry => {
+                entry.or_insert(component);
+            }
+        }
         remap.insert(original, reference);
     }
     validate_unique_import_targets(&remap)?;
@@ -1138,7 +1149,7 @@ fn same_component(primary: &Value, incoming: &Value, allow_scan_count_difference
         return false;
     }
     // The same package can contribute a different number of VIs to each
-    // source scan. Keep the primary scan's count when sharing the package.
+    // source scan. The count is evidence for that scan, not package identity.
     let without_scan_count = |component: &Value| {
         let mut component = component.as_object().expect("validated component").clone();
         if let Some(properties) = component
@@ -1153,6 +1164,12 @@ fn same_component(primary: &Value, incoming: &Value, allow_scan_count_difference
         component
     };
     without_scan_count(primary) == without_scan_count(incoming)
+}
+
+fn matched_file_count(component: &Value) -> Option<usize> {
+    property_values(component, MATCHED_FILES)
+        .next()
+        .and_then(|value| value.parse().ok())
 }
 
 fn read_primary(path: &Path) -> Result<Bom> {
@@ -1603,6 +1620,74 @@ mod tests {
             artifact["hashes"] = json!([{"alg": "SHA-256", "content": digest}]);
         }
         artifact
+    }
+
+    #[test]
+    fn configured_builds_keep_the_largest_match_count_for_a_shared_package() {
+        let primary = json!({
+            "bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+            "metadata": {"component": {"type": "application", "bom-ref": "installer", "name": "Installer"}},
+            "components": [{"type": "library", "bom-ref": "ni-runtime", "name": "NI runtime"}],
+            "dependencies": [{"ref": "installer", "dependsOn": ["ni-runtime"]}]
+        });
+        let digest = "ab".repeat(32);
+        let package = |reference: &str, count: &str| {
+            json!({
+                "type": "library", "bom-ref": reference, "name": "driver", "version": "1.2.3",
+                "purl": "pkg:generic/driver@1.2.3",
+                "hashes": [{"alg": "SHA-256", "content": digest}],
+                "properties": [
+                    {"name": FILE_SUBJECT, "value": "package-archive"},
+                    {"name": MATCHED_FILES, "value": count}
+                ]
+            })
+        };
+        let declared = json!({
+            "bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+            "metadata": {"component": {"type": "application", "bom-ref": "exe", "name": "EXE"}},
+            "components": [
+                {"type": "library", "bom-ref": "library", "name": "Library"},
+                package("driver", "0")
+            ],
+            "dependencies": [
+                {"ref": "exe", "dependsOn": ["library"]},
+                {"ref": "library", "dependsOn": ["driver"]}
+            ]
+        });
+        let observed = json!({
+            "bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+            "metadata": {"component": {"type": "library", "bom-ref": "source", "name": "Source"}},
+            "components": [package("driver-observed", "7")],
+            "dependencies": [{"ref": "source", "dependsOn": ["driver-observed"]}]
+        });
+
+        for (children, reference) in [
+            (vec![declared.clone(), observed.clone()], "driver"),
+            (vec![observed, declared], "driver-observed"),
+        ] {
+            let combined =
+                parse(merge_configured_builds(primary.clone(), children).unwrap()).unwrap();
+            assert_eq!(combined.purls["pkg:generic/driver@1.2.3"], reference);
+            assert_eq!(combined.nodes[reference], package(reference, "7"));
+            assert_eq!(
+                combined.edges["installer"],
+                Some(BTreeSet::from([
+                    "exe".into(),
+                    "ni-runtime".into(),
+                    "source".into()
+                ]))
+            );
+            assert_eq!(
+                combined.edges["exe"],
+                Some(BTreeSet::from(["library".into()]))
+            );
+            for from in ["library", "source"] {
+                assert_eq!(
+                    combined.edges[from],
+                    Some(BTreeSet::from([reference.into()]))
+                );
+            }
+        }
     }
 
     #[test]

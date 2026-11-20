@@ -1,13 +1,68 @@
-//! Attribute scanned VI paths to installed packages and project the link graph.
+//! Project VI links and declared requirements onto the installed package graph.
 
 use crate::install::{self, PackageMetadata};
 use crate::sbom_paths::{diagnostic_path, redact_paths};
+use crate::version::{Version, is_version};
 use crate::{cache, index, spec, target, vi_graph};
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub type PackageId = (String, String);
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub struct VersionConstraint {
+    pub operator: &'static str,
+    pub version: Version,
+}
+
+impl VersionConstraint {
+    fn allows(&self, installed: &Version) -> bool {
+        match self.operator {
+            ">=" => installed >= &self.version,
+            "<=" => installed <= &self.version,
+            ">" => installed > &self.version,
+            "<" => installed < &self.version,
+            "=" | "==" => installed == &self.version,
+            _ => unreachable!("validated version comparison"),
+        }
+    }
+}
+
+fn declared_requirements(
+    entries: &[String],
+) -> Result<BTreeMap<String, BTreeSet<VersionConstraint>>> {
+    let mut requirements = BTreeMap::<String, BTreeSet<_>>::new();
+    for entry in entries {
+        let comparison = entry.find(['<', '>', '=']).unwrap_or(entry.len());
+        let (name, expression) = entry.split_at(comparison);
+        let name = name.trim();
+        crate::palette::validate_package_name(name)
+            .with_context(|| format!("invalid package requirement {entry:?}"))?;
+        let constraints = requirements.entry(name.to_ascii_lowercase()).or_default();
+        if !expression.is_empty() {
+            // Match compound operators first so their final '=' is not read as
+            // part of the version, and retain the exact comparison as evidence.
+            let (operator, version) = [">=", "<=", "==", ">", "<", "="]
+                .into_iter()
+                .find_map(|op| {
+                    expression
+                        .strip_prefix(op)
+                        .map(|version| (op, version.trim()))
+                })
+                .expect("expression begins with a comparison character");
+            ensure!(
+                is_version(version) && !version.split(['.', '-']).any(str::is_empty),
+                "invalid package requirement {entry:?}: {version:?} is not a version"
+            );
+            constraints.insert(VersionConstraint {
+                operator,
+                version: Version::parse(version),
+            });
+        }
+    }
+    Ok(requirements)
+}
 
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
 pub enum ComponentId {
@@ -19,6 +74,7 @@ pub struct Package {
     pub name: String,
     pub metadata: Option<PackageMetadata>,
     pub matched_files: usize,
+    pub required: BTreeMap<PackageId, BTreeSet<VersionConstraint>>,
 }
 
 pub struct PackageGraph {
@@ -77,7 +133,13 @@ pub fn project(
         }
         for record in records {
             let files = matched(&paths, record.files.iter().map(String::as_str));
-            inventory.add(record.name, record.version, record.package_metadata, files)?;
+            inventory.add(
+                record.name,
+                record.version,
+                record.package_metadata,
+                record.dependencies,
+                files,
+            );
         }
     }
 
@@ -85,7 +147,7 @@ pub fn project(
     if let Some(database) = vipm_database.or(default_database.as_deref()) {
         inventory.read_vipm(database, &paths, output)?;
     }
-    Ok(inventory.collapse(graph))
+    inventory.collapse(graph, output)
 }
 
 fn default_vipm_database(labview: &target::LvTarget) -> Option<PathBuf> {
@@ -123,10 +185,17 @@ fn matched<'a, 'b>(
         .collect()
 }
 
+struct InstalledPackage {
+    package: Package,
+    requirements: Vec<String>,
+    archive_conflict: bool,
+}
+
 #[derive(Default)]
 struct Inventory<'a> {
     claims: BTreeMap<&'a str, BTreeSet<PackageId>>,
-    packages: BTreeMap<PackageId, Package>,
+    packages: BTreeMap<PackageId, InstalledPackage>,
+    unused_vipm_records: BTreeMap<String, BTreeSet<PathBuf>>,
     issues: BTreeSet<String>,
 }
 
@@ -136,32 +205,33 @@ impl<'a> Inventory<'a> {
         name: String,
         version: String,
         metadata: Option<PackageMetadata>,
+        requirements: Vec<String>,
         files: BTreeSet<&'a str>,
-    ) -> Result<()> {
-        if files.is_empty() {
-            return Ok(());
-        }
+    ) {
         let id = (name.to_ascii_lowercase(), version);
-        let package = self.packages.entry(id.clone()).or_insert_with(|| Package {
-            name,
-            metadata: None,
-            matched_files: 0,
-        });
-        if let (Some(existing), Some(incoming)) = (&package.metadata, &metadata) {
-            ensure!(
-                existing.archive_sha256 == incoming.archive_sha256,
-                "different archives claim package {}@{}",
-                id.0,
-                id.1
-            );
+        let record = self
+            .packages
+            .entry(id.clone())
+            .or_insert_with(|| InstalledPackage {
+                package: Package {
+                    name,
+                    metadata: None,
+                    matched_files: 0,
+                    required: BTreeMap::new(),
+                },
+                requirements: Vec::new(),
+                archive_conflict: false,
+            });
+        if let (Some(existing), Some(incoming)) = (&record.package.metadata, &metadata) {
+            record.archive_conflict |= existing.archive_sha256 != incoming.archive_sha256;
         }
-        if package.metadata.is_none() {
-            package.metadata = metadata;
+        if record.package.metadata.is_none() {
+            record.package.metadata = metadata;
         }
+        record.requirements.extend(requirements);
         for file in files {
             self.claims.entry(file).or_default().insert(id.clone());
         }
-        Ok(())
     }
 
     fn read_vipm(
@@ -208,38 +278,194 @@ impl<'a> Inventory<'a> {
                     }),
             );
             if files.is_empty() {
-                continue;
-            }
-            let archive = match vipm_archive_path(&dir) {
-                Ok(archive) => archive,
-                Err(error) => {
-                    self.issues.insert(format!(
-                        "VIPM record {}: {error:#}",
-                        entry.file_name().to_string_lossy()
-                    ));
-                    continue;
-                }
-            };
-            if let Some(output) = output {
-                output.protect(&archive)?;
-            }
-            match read_vipm_archive(&dir, &archive) {
-                Ok((name, version, metadata)) => self.add(name, version, Some(metadata), files)?,
-                Err(error) => {
-                    self.issues.insert(format!(
-                        "VIPM record {}: {error:#}",
-                        entry.file_name().to_string_lossy()
-                    ));
-                }
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                self.unused_vipm_records
+                    .entry(name)
+                    .or_default()
+                    .insert(dir);
+            } else {
+                self.load_vipm_record(&dir, files, output)?;
             }
         }
         Ok(())
     }
 
-    fn collapse(mut self, graph: &vi_graph::Graph) -> PackageGraph {
+    fn load_vipm_record(
+        &mut self,
+        dir: &Path,
+        files: BTreeSet<&'a str>,
+        output: Option<&crate::sbom_paths::OutputGuard>,
+    ) -> Result<()> {
+        let archive = vipm_archive_path(dir);
+        if let (Some(output), Ok(path)) = (output, &archive) {
+            output.protect(path)?;
+        }
+        let record = archive.and_then(|archive| read_vipm_archive(dir, &archive));
+        match record {
+            Ok((name, version, metadata, requires)) => {
+                self.add(name, version, Some(metadata), requires, files);
+            }
+            Err(error) => {
+                let name = dir
+                    .file_name()
+                    .expect("package directory")
+                    .to_string_lossy();
+                let reason = redact_paths(&format!("{error:#}"));
+                self.issues.insert(format!("VIPM record {name}: {reason}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn load_available_versions(
+        &mut self,
+        name: &str,
+        output: Option<&crate::sbom_paths::OutputGuard>,
+    ) -> Result<()> {
+        if let Some(dirs) = self.unused_vipm_records.remove(name) {
+            for dir in dirs {
+                self.load_vipm_record(&dir, BTreeSet::new(), output)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_requirement(
+        &mut self,
+        source: &PackageId,
+        name: &str,
+        constraints: &BTreeSet<VersionConstraint>,
+        output: Option<&crate::sbom_paths::OutputGuard>,
+    ) -> Result<Option<PackageId>> {
+        self.load_available_versions(name, output)?;
+
+        // If a VI resolved to an installed version, its physical owner is
+        // stronger evidence than a different copy listed in another store.
+        let mut candidates: Vec<_> = self
+            .packages
+            .range((name.to_owned(), String::new())..)
+            .take_while(|(id, _)| id.0 == name)
+            .collect();
+        if candidates
+            .iter()
+            .any(|(_, installed)| installed.package.matched_files != 0)
+        {
+            candidates.retain(|(_, installed)| installed.package.matched_files != 0);
+        }
+        let matches: Vec<_> = candidates
+            .iter()
+            .filter(|(id, _)| {
+                if constraints.is_empty() {
+                    return true;
+                }
+                if !is_version(&id.1) {
+                    return false;
+                }
+                let installed = Version::parse(&id.1);
+                constraints
+                    .iter()
+                    .all(|constraint| constraint.allows(&installed))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if let [id] = matches.as_slice() {
+            return Ok(Some((*id).clone()));
+        }
+
+        let requested = if constraints.is_empty() {
+            name.to_owned()
+        } else {
+            constraints
+                .iter()
+                .map(|constraint| format!("{name}{}{}", constraint.operator, constraint.version))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let versions = candidates
+            .iter()
+            .map(|(id, _)| id.1.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let issue = if candidates.is_empty() {
+            "not installed".to_owned()
+        } else if matches.is_empty() {
+            format!("installed versions do not satisfy the requirement ({versions})")
+        } else {
+            format!("ambiguous installed versions ({versions})")
+        };
+        self.issues.insert(format!(
+            "{}@{} requires {requested}: {issue}",
+            source.0, source.1
+        ));
+        Ok(None)
+    }
+
+    fn follow_requirements(
+        &mut self,
+        roots: impl Iterator<Item = PackageId>,
+        edges: &mut BTreeMap<ComponentId, BTreeSet<ComponentId>>,
+        output: Option<&crate::sbom_paths::OutputGuard>,
+    ) -> Result<BTreeSet<PackageId>> {
+        let mut seen = BTreeSet::new();
+        let mut pending: Vec<_> = roots.collect();
+        while let Some(source) = pending.pop() {
+            if !seen.insert(source.clone()) {
+                continue;
+            }
+            // Load any additional record for this name before closing over
+            // its requirements. Future dependency lookups cannot change it.
+            self.load_available_versions(&source.0, output)?;
+            let record = &self.packages[&source];
+            ensure!(
+                !record.archive_conflict,
+                "different archives claim package {}@{}",
+                source.0,
+                source.1
+            );
+            let from = ComponentId::Package(source.clone());
+            let direct = edges.entry(from).or_default();
+            let requirements = match declared_requirements(&record.requirements) {
+                Ok(requirements) => requirements,
+                Err(error) => {
+                    self.issues.insert(format!(
+                        "{}@{} has invalid Requires: {error:#}",
+                        source.0, source.1
+                    ));
+                    continue;
+                }
+            };
+            for (name, constraints) in requirements {
+                let Some(dependency) =
+                    self.resolve_requirement(&source, &name, &constraints, output)?
+                else {
+                    continue;
+                };
+                if dependency == source {
+                    // A self-requirement can constrain the installed version,
+                    // but CycloneDX forbids a dependency on the same bom-ref.
+                    continue;
+                }
+                direct.insert(ComponentId::Package(dependency.clone()));
+                self.packages
+                    .get_mut(&source)
+                    .expect("installed package")
+                    .package
+                    .required
+                    .insert(dependency.clone(), constraints);
+                pending.push(dependency);
+            }
+        }
+        Ok(seen)
+    }
+
+    fn collapse(
+        mut self,
+        graph: &vi_graph::Graph,
+        output: Option<&crate::sbom_paths::OutputGuard>,
+    ) -> Result<PackageGraph> {
         let mut owners = BTreeMap::new();
         let mut package_files = BTreeMap::<PackageId, Vec<&str>>::new();
-        for (file, claims) in self.claims {
+        for (file, claims) in std::mem::take(&mut self.claims) {
             if claims.len() != 1 {
                 self.issues.insert(format!(
                     "{file} belongs to multiple packages: {}",
@@ -255,10 +481,13 @@ impl<'a> Inventory<'a> {
             package_files.entry(owner.clone()).or_default().push(file);
             owners.insert(file, owner);
         }
-        self.packages.retain(|id, package| {
-            package.matched_files = package_files.get(id).map_or(0, Vec::len);
-            package.matched_files > 0
-        });
+        for (id, files) in &package_files {
+            self.packages
+                .get_mut(id)
+                .expect("matched package")
+                .package
+                .matched_files = files.len();
+        }
         let unowned_external = graph
             .files
             .keys()
@@ -275,12 +504,13 @@ impl<'a> Inventory<'a> {
             None,
         );
         let mut edges: BTreeMap<_, _> = package_files
-            .into_iter()
+            .iter()
             .map(|(id, files)| {
-                let direct = first_components(graph, &owners, files, Some(&id));
-                (ComponentId::Package(id), direct)
+                let direct = first_components(graph, &owners, files.clone(), Some(id));
+                (ComponentId::Package(id.clone()), direct)
             })
             .collect();
+        let included = self.follow_requirements(package_files.into_keys(), &mut edges, output)?;
         for label in graph.packed.keys() {
             if let Some(direct) = graph.edges.get(label) {
                 edges.insert(
@@ -289,13 +519,22 @@ impl<'a> Inventory<'a> {
                 );
             }
         }
-        PackageGraph {
-            packages: self.packages,
+        Ok(PackageGraph {
+            packages: self
+                .packages
+                .into_iter()
+                .filter(|(id, _)| included.contains(id))
+                .map(|(id, installed)| (id, installed.package))
+                .collect(),
             roots,
             edges,
-            issues: self.issues,
+            issues: self
+                .issues
+                .into_iter()
+                .map(|issue| redact_paths(&issue))
+                .collect(),
             unowned_external,
-        }
+        })
     }
 }
 
@@ -349,7 +588,10 @@ fn vipm_archive_path(dir: &Path) -> Result<PathBuf> {
     Ok(archives.pop().expect("one archive"))
 }
 
-fn read_vipm_archive(dir: &Path, archive: &Path) -> Result<(String, String, PackageMetadata)> {
+fn read_vipm_archive(
+    dir: &Path,
+    archive: &Path,
+) -> Result<(String, String, PackageMetadata, Vec<String>)> {
     let bytes = std::fs::read(archive)?;
     let md5 = index::md5_hex(&bytes);
     let sha256 = cache::sha256_hex(&bytes);
@@ -368,5 +610,14 @@ fn read_vipm_archive(dir: &Path, archive: &Path) -> Result<(String, String, Pack
         archive_md5: md5,
         archive_sha256: sha256,
     };
-    Ok((spec.name, spec.version, metadata))
+    let requirements = spec
+        .requires
+        .as_deref()
+        .unwrap_or_default()
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Ok((spec.name, spec.version, metadata, requirements))
 }

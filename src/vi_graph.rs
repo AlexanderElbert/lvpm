@@ -126,17 +126,24 @@ fn scan_sources(
     let mut edges = BTreeMap::new();
     let mut files = BTreeMap::new();
     let mut packed = PackedScan::default();
-    let mut expanded = BTreeSet::new();
+    let mut expanded = BTreeMap::new();
     let mut pending = roots
         .iter()
         .cloned()
-        .map(|file| (file, true))
+        .map(|file| (file, Members::All))
         .collect::<Vec<_>>();
-    while let Some((file, expand_members)) = pending.pop() {
+    while let Some((file, members)) = pending.pop() {
         let label = locations.label(&file);
-        let expand_members =
-            (expand_members || roots.contains(&file)) && linkfix::is_library_xml(&file);
-        if edges.contains_key(&label) && (!expand_members || expanded.contains(&label)) {
+        let members = if !linkfix::is_library_xml(&file) {
+            Members::None
+        } else if roots.contains(&file) {
+            Members::All
+        } else {
+            members
+        };
+        if edges.contains_key(&label)
+            && expanded.get(&label).copied().unwrap_or(Members::None) >= members
+        {
             continue;
         }
         if extension_is(&file, "lvlibp") {
@@ -145,10 +152,10 @@ fn scan_sources(
             edges.insert(label, direct);
             continue;
         }
-        if expand_members {
-            expanded.insert(label.clone());
+        if members != Members::None {
+            expanded.insert(label.clone(), members);
         }
-        let links = match read_links(&file, &locations, expand_members, &mut issues) {
+        let links = match read_links(&file, &locations, members, &mut issues) {
             Ok(links) => links,
             Err(error) => {
                 issues.insert(format!("{label}: {error:#}"));
@@ -161,9 +168,12 @@ fn scan_sources(
                 let child = locations.label(&resolved);
                 if child != label {
                     direct.insert(child);
-                    // Selected sources can own nested libraries and classes.
-                    // Follow containment for expansion of their members.
-                    pending.push((resolved, expand_nested_members && link.member));
+                    let members = match link.kind {
+                        LinkKind::ClassType => Members::Dispatch,
+                        LinkKind::Member if expand_nested_members => Members::All,
+                        _ => Members::None,
+                    };
+                    pending.push((resolved, members));
                 }
             } else {
                 issues.insert(format!("{label} -> {}", locations.label(&link.path)));
@@ -206,7 +216,7 @@ pub(crate) fn scan_packed_files(project: &Path, files: BTreeSet<PathBuf>) -> Res
     for path in files {
         if let Some(resolved) = resolve_file(&path).filter(|file| extension_is(file, "lvlibp")) {
             roots.insert(locations.label(&resolved));
-            pending.push((resolved, false));
+            pending.push((resolved, Members::None));
         } else {
             issues.insert(format!(
                 "packed library payload file {} is missing",
@@ -297,7 +307,7 @@ impl PackedScan {
         file: &Path,
         label: &str,
         locations: &Locations<'_>,
-        pending: &mut Vec<(PathBuf, bool)>,
+        pending: &mut Vec<(PathBuf, Members)>,
         issues: &mut BTreeSet<String>,
     ) -> BTreeSet<String> {
         let artifact = self.read(file);
@@ -324,7 +334,7 @@ impl PackedScan {
                         .reference_paths
                         .insert(reference_path);
                     direct.insert(child);
-                    pending.push((path, false));
+                    pending.push((path, Members::None));
                 }
             } else {
                 let child = format!(
@@ -744,27 +754,35 @@ fn llb_container(file: &Path) -> Option<&Path> {
         .find(|path| extension_is(path, "llb") && path.is_file())
 }
 
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum Members {
+    None,
+    Dispatch,
+    All,
+}
+
+enum LinkKind {
+    Reference,
+    Member,
+    ClassType,
+}
+
 struct ScanLink {
     path: PathBuf,
-    member: bool,
+    kind: LinkKind,
 }
 
 fn read_links(
     file: &Path,
     locations: &Locations<'_>,
-    expand_library: bool,
+    members: Members,
     issues: &mut BTreeSet<String>,
 ) -> Result<Vec<ScanLink>> {
-    let dependency = |path| ScanLink {
-        path,
-        member: false,
-    };
-    if linkfix::is_library_xml(file) || extension_is(file, "xnode") || extension_is(file, "xctl") {
-        return xml_links(
-            file,
-            locations,
-            expand_library || !linkfix::is_library_xml(file),
-        );
+    if linkfix::is_library_xml(file) {
+        return xml_links(file, locations, members);
+    }
+    if extension_is(file, "xnode") || extension_is(file, "xctl") {
+        return xml_links(file, locations, Members::All);
     }
     if extension_is(file, "llb") {
         let bytes = std::fs::read(file)?;
@@ -774,7 +792,10 @@ fn read_links(
             .into_iter()
             .map(|(name, _)| file.join(name))
             .filter(|path| is_labview_file(path))
-            .map(dependency)
+            .map(|path| ScanLink {
+                path,
+                kind: LinkKind::Reference,
+            })
             .collect());
     }
     let container = llb_container(file);
@@ -793,7 +814,7 @@ fn read_links(
     let resource = linkfix::Rsrc::parse(data)?;
     let mut paths = Vec::new();
     read_resource_links(&resource, file, locations, issues, &mut paths)?;
-    Ok(paths.into_iter().map(dependency).collect())
+    Ok(paths)
 }
 
 fn read_resource_links(
@@ -801,7 +822,7 @@ fn read_resource_links(
     file: &Path,
     locations: &Locations<'_>,
     issues: &mut BTreeSet<String>,
-    paths: &mut Vec<PathBuf>,
+    paths: &mut Vec<ScanLink>,
 ) -> Result<()> {
     let version = resource.version()?;
     let mut scanned_instances = BTreeSet::new();
@@ -840,7 +861,16 @@ fn read_resource_links(
                 }
             }
             match locations.link(file, &link.path) {
-                Ok(Some(path)) if is_labview_file(&path) => paths.push(path),
+                Ok(Some(path)) if is_labview_file(&path) => {
+                    // A saved class type link can dispatch to that class's
+                    // instance methods even without a direct method link.
+                    let kind = if link.ident.ends_with(b"PI") && extension_is(&path, "lvclass") {
+                        LinkKind::ClassType
+                    } else {
+                        LinkKind::Reference
+                    };
+                    paths.push(ScanLink { path, kind });
+                }
                 Ok(_) => {}
                 Err(error) => {
                     issues.insert(format!("{}: {error:#}", locations.label(file)));
@@ -851,21 +881,20 @@ fn read_resource_links(
     Ok(())
 }
 
-fn xml_links(
-    file: &Path,
-    locations: &Locations<'_>,
-    expand_members: bool,
-) -> Result<Vec<ScanLink>> {
+fn xml_links(file: &Path, locations: &Locations<'_>, members: Members) -> Result<Vec<ScanLink>> {
     use quick_xml::events::Event;
 
-    if !expand_members && !extension_is(file, "lvclass") {
+    let class = extension_is(file, "lvclass");
+    if members == Members::None && !class {
         return Ok(Vec::new());
     }
     let xml = std::fs::read_to_string(file)?;
     let mut reader = quick_xml::Reader::from_str(&xml);
     let mut paths = Vec::new();
     loop {
-        match reader.read_event()? {
+        let event = reader.read_event()?;
+        let start = matches!(&event, Event::Start(_));
+        match event {
             Event::Start(item) | Event::Empty(item) if item.name().as_ref() == b"Item" => {
                 let Some(kind) = item.try_get_attribute("Type")? else {
                     continue;
@@ -881,7 +910,14 @@ fn xml_links(
                         | "Control"
                         | "Ability VI"
                 );
-                if (kind == "Parent" || (expand_members && member))
+                let include_member = match members {
+                    Members::All => member,
+                    Members::Dispatch if class && kind == "VI" && start => {
+                        is_instance_method(&mut reader)?
+                    }
+                    _ => false,
+                };
+                if (kind == "Parent" || include_member)
                     && let Some(url) = item.try_get_attribute("URL")?
                 {
                     let url = url.decode_and_unescape_value(reader.decoder())?;
@@ -889,12 +925,44 @@ fn xml_links(
                     if is_labview_file(&path) {
                         paths.push(ScanLink {
                             path,
-                            member: expand_members && member,
+                            kind: if include_member {
+                                LinkKind::Member
+                            } else {
+                                LinkKind::Reference
+                            },
                         });
                     }
                 }
             }
             Event::Eof => return Ok(paths),
+            _ => {}
+        }
+    }
+}
+
+/// Read the saved dispatch flag from the immediate properties of a method item.
+fn is_instance_method(reader: &mut quick_xml::Reader<&[u8]>) -> Result<bool> {
+    use quick_xml::events::Event;
+    use quick_xml::name::QName;
+
+    let mut depth = 0;
+    loop {
+        match reader.read_event()? {
+            Event::Start(property)
+                if depth == 0
+                    && property.name().as_ref() == b"Property"
+                    && property.try_get_attribute("Name")?.is_some_and(|name| {
+                        name.value.as_ref() == b"NI.ClassItem.IsStaticMethod"
+                    }) =>
+            {
+                let value = reader.read_text(QName(b"Property"))?;
+                reader.read_to_end(QName(b"Item"))?;
+                return Ok(value.trim().eq_ignore_ascii_case("false"));
+            }
+            Event::Start(_) => depth += 1,
+            Event::End(_) if depth == 0 => return Ok(false),
+            Event::End(_) => depth -= 1,
+            Event::Eof => anyhow::bail!("unclosed class method item"),
             _ => {}
         }
     }
