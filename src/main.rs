@@ -2040,7 +2040,7 @@ fn cmd_install(
         };
 
         let mut zip = install::open_archive(bytes)?;
-        let spec = spec::parse(&read_spec(&mut zip)?)?;
+        let spec = spec::parse(&install::read_spec(&mut zip)?)?;
         let p = install::plan(&roots, &spec, &mut zip)?;
 
         total_writes += p.writes.len();
@@ -2087,7 +2087,14 @@ fn cmd_install(
                 }
                 std::io::stdout().flush().ok();
             }
-            let m = install::apply(&roots, &spec, &mut zip, &p, pre.as_deref(), dependency::package_dependency_names(e, spec.requires.as_deref()))?;
+            let m = install::apply(
+                &roots,
+                &spec,
+                zip,
+                &p,
+                pre.as_deref(),
+                dependency::package_dependency_names(e, spec.requires.as_deref()),
+            )?;
             log!("{} files", m.files.len());
             relink_work.push((e.name.clone(), m.relink_folders.iter().map(PathBuf::from).collect()));
             // The record now holds PostInstall as pending; the hook step
@@ -3564,21 +3571,6 @@ fn cmd_vi_run(
     conn.release(vi_ref)?;
     conn.close();
     result
-}
-
-fn read_spec(zip: &mut zip::ZipArchive<std::io::Cursor<Vec<u8>>>) -> Result<String> {
-    // Almost always literally "spec" at the archive root.
-    let idx = (0..zip.len()).find(|i| {
-        zip.by_index(*i).is_ok_and(|f| f.name().is_ok_and(|n| n.eq_ignore_ascii_case("spec")))
-    });
-    let Some(idx) = idx else {
-        bail!("no `spec` member in .vip archive");
-    };
-    let mut f = zip.by_index(idx)?;
-    let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut f, &mut buf)?;
-    // spec files are latin-1-ish; lossy is fine for the fields we read.
-    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 #[cfg(test)]
