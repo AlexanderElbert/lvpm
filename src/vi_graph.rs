@@ -813,19 +813,29 @@ fn read_links(
     };
     let resource = linkfix::Rsrc::parse(data)?;
     let mut paths = Vec::new();
-    read_resource_links(&resource, file, locations, issues, &mut paths)?;
+    let mut scanned_instances = BTreeSet::new();
+    read_resource_links(
+        &resource,
+        file,
+        file,
+        locations,
+        issues,
+        &mut paths,
+        &mut scanned_instances,
+    )?;
     Ok(paths)
 }
 
 fn read_resource_links(
     resource: &linkfix::Rsrc,
     file: &Path,
+    link_source: &Path,
     locations: &Locations<'_>,
     issues: &mut BTreeSet<String>,
     paths: &mut Vec<ScanLink>,
+    scanned_instances: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
     let version = resource.version()?;
-    let mut scanned_instances = BTreeSet::new();
     for section in &resource.sections {
         if !matches!(&section.ident, b"LIvi" | b"LIbd" | b"LIfp" | b"LIds") {
             continue;
@@ -842,25 +852,61 @@ fn read_resource_links(
             }
         };
         for link in links.objs {
-            if let Some(name) = link.embedded_instance_name() {
-                if scanned_instances.contains(name) {
-                    continue;
-                }
-                if let Some(embedded) = resource.embedded_vi(name) {
-                    scanned_instances.insert(name.to_vec());
-                    if let Err(error) =
-                        read_resource_links(&embedded, file, locations, issues, paths)
-                    {
-                        issues.insert(format!(
-                            "{}: reading embedded VI {}: {error:#}",
-                            locations.label(file),
-                            String::from_utf8_lossy(name)
-                        ));
-                    }
-                    continue;
-                }
+            // The enclosing VINS resource stays part of the same physical VI.
+            if link_source != file && link.is_embedded_owner() {
+                continue;
             }
-            match locations.link(file, &link.path) {
+            if let Some(instance_path) = link.embedded_instance_path() {
+                // VINS paths start inside the enclosing VI's virtual directory.
+                let instance_source = instance_path.iter().try_fold(
+                    link_source.to_path_buf(),
+                    |mut source, name| {
+                        let name = String::from_utf8_lossy(name);
+                        let entry = Path::new(name.as_ref());
+                        if entry.file_name() != Some(entry.as_os_str()) {
+                            return None;
+                        }
+                        source.push(entry);
+                        Some(source)
+                    },
+                );
+                let Some(instance_source) = instance_source else {
+                    issues.insert(format!(
+                        "{}: invalid embedded VI basename",
+                        locations.label(file)
+                    ));
+                    continue;
+                };
+                if scanned_instances.contains(&instance_source) {
+                    continue;
+                }
+                let Some(embedded) = resource.embedded_vi(instance_path) else {
+                    issues.insert(format!(
+                        "{} -> {}",
+                        locations.label(file),
+                        locations.label(&instance_source)
+                    ));
+                    continue;
+                };
+                scanned_instances.insert(instance_source.clone());
+                if let Err(error) = read_resource_links(
+                    &embedded,
+                    file,
+                    &instance_source,
+                    locations,
+                    issues,
+                    paths,
+                    scanned_instances,
+                ) {
+                    issues.insert(format!(
+                        "{}: reading embedded VI {}: {error:#}",
+                        locations.label(file),
+                        locations.label(&instance_source)
+                    ));
+                }
+                continue;
+            }
+            match locations.link(link_source, &link.path) {
                 Ok(Some(path)) if is_labview_file(&path) => {
                     // A saved class type link can dispatch to that class's
                     // instance methods even without a direct method link.

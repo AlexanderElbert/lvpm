@@ -136,13 +136,19 @@ impl Rsrc {
         out
     }
 
-    /// Locate an embedded VI by the name stored on its LVSR section.
-    pub(crate) fn embedded_vi(&self, name: &[u8]) -> Option<Rsrc> {
-        self.sections.iter().filter(|section| &section.ident == b"VINS").find_map(|section| {
+    /// Locate a named VINS resource at each level of an embedded instance path.
+    pub(crate) fn embedded_vi(&self, path: &[Vec<u8>]) -> Option<Rsrc> {
+        let (name, nested) = path.split_first()?;
+        let embedded = self.sections.iter().filter(|section| &section.ident == b"VINS").find_map(|section| {
             let embedded = Self::parse(&section.data).ok()?;
             let record = embedded.section(b"LVSR")?;
-            (embedded.section_name(record)? == name).then_some(embedded)
-        })
+            (embedded.section_name(record)? == name.as_slice()).then_some(embedded)
+        })?;
+        if nested.is_empty() {
+            Some(embedded)
+        } else {
+            embedded.embedded_vi(nested)
+        }
     }
 
     fn section_name(&self, section: &Section) -> Option<&[u8]> {
@@ -456,25 +462,37 @@ pub fn separate_compiled_code(rsrc: &mut Rsrc) -> Result<bool> {
 }
 
 // ---------------------------------------------------------------------------
-// PTH0 path records.
+// PTH0 and PTH2 path records.
 // ---------------------------------------------------------------------------
 
-/// `"PTH0" | u32 length | u16 type | u16 count | pascal components`. Type 0 is
-/// absolute — a drive letter or a `<vilib>`-style token as the first
-/// component — and type 1 is relative: a leading empty component means "from
-/// this VI's folder", each further empty one goes up a level.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PthFormat {
+    Pth0 { zero_length: bool },
+    Pth2,
+}
+
+/// A saved LabVIEW path. Type 0 is absolute or a token, and type 1 is
+/// relative: the first empty component anchors it at the VI's directory and
+/// each further empty component goes up a level. Types 2 and 3 are an invalid
+/// path and a UNC path, respectively.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pth {
     pub tp: u16,
     pub comps: Vec<Vec<u8>>,
-    /// Written with a zero length field: the empty placeholder form.
-    zero: bool,
+    format: PthFormat,
 }
 
 impl Pth {
     pub(crate) fn parse(b: &[u8], pos: usize) -> Result<(Pth, usize)> {
-        ensure!(b.get(pos..pos + 4) == Some(b"PTH0"), "no PTH0 at {pos}");
         let totlen = be32(b, pos + 4)? as usize;
+        match b.get(pos..pos + 4) {
+            Some(b"PTH0") => Self::parse_pth0(b, pos, totlen),
+            Some(b"PTH2") => Self::parse_pth2(b, pos + 8, totlen),
+            _ => bail!("unrecognized path record at {pos}"),
+        }
+    }
+
+    fn parse_pth0(b: &[u8], pos: usize, totlen: usize) -> Result<(Pth, usize)> {
         let tp = be16(b, pos + 8)?;
         let count = be16(b, pos + 10)? as usize;
         ensure!(count <= 128, "PTH0 with {count} components");
@@ -486,26 +504,82 @@ impl Pth {
             comps.push(b[p + 1..p + 1 + n].to_vec());
             p += 1 + n;
         }
-        let ctlen = 4 + comps.iter().map(|c| 1 + c.len()).sum::<usize>();
+        let ctlen = p - (pos + 8);
         ensure!(totlen == ctlen || totlen == 0, "PTH0 length {totlen} does not match content {ctlen}");
-        Ok((Pth { tp, comps, zero: totlen == 0 }, p))
+        Ok((Pth { tp, comps, format: PthFormat::Pth0 { zero_length: totlen == 0 } }, p))
+    }
+
+    // PTH2 stores a four-byte path type followed by u16-length components,
+    // bounded by the payload length. Unlike PTH0 it has no component count.
+    fn parse_pth2(b: &[u8], start: usize, totlen: usize) -> Result<(Pth, usize)> {
+        let end = start.checked_add(totlen).context("PTH2 length overflow")?;
+        let data = b.get(start..end).context("truncated PTH2")?;
+        let tp = match data.get(..4) {
+            Some(b"abs ") => 0,
+            Some(b"rel ") => 1,
+            Some(b"!pth") => 2,
+            Some(b"unc ") => 3,
+            _ => bail!("invalid PTH2 path type"),
+        };
+        let mut comps = Vec::new();
+        let mut p = 4;
+        while p < data.len() {
+            ensure!(comps.len() < 128, "PTH2 with more than 128 components");
+            let n = be16(data, p)? as usize;
+            p += 2;
+            comps.push(data.get(p..p + n).context("truncated PTH2 component")?.to_vec());
+            p += n;
+        }
+        Ok((Pth { tp, comps, format: PthFormat::Pth2 }, end))
     }
 
     fn write(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(b"PTH0");
-        let ctlen = 4 + self.comps.iter().map(|c| 1 + c.len()).sum::<usize>();
-        let totlen = if self.zero && self.tp == 0 && self.comps.is_empty() { 0 } else { ctlen };
-        out.extend_from_slice(&(totlen as u32).to_be_bytes());
-        out.extend_from_slice(&self.tp.to_be_bytes());
-        out.extend_from_slice(&(self.comps.len() as u16).to_be_bytes());
-        for c in &self.comps {
-            out.push(c.len() as u8);
-            out.extend_from_slice(c);
+        match self.format {
+            PthFormat::Pth0 { zero_length } => {
+                out.extend_from_slice(b"PTH0");
+                let ctlen = 4 + self.comps.iter().map(|c| 1 + c.len()).sum::<usize>();
+                let totlen = if zero_length && self.tp == 0 && self.comps.is_empty() { 0 } else { ctlen };
+                out.extend_from_slice(&(totlen as u32).to_be_bytes());
+                out.extend_from_slice(&self.tp.to_be_bytes());
+                out.extend_from_slice(&(self.comps.len() as u16).to_be_bytes());
+                for c in &self.comps {
+                    out.push(c.len() as u8);
+                    out.extend_from_slice(c);
+                }
+            }
+            PthFormat::Pth2 => {
+                out.extend_from_slice(b"PTH2");
+                let totlen = 4 + self.comps.iter().map(|c| 2 + c.len()).sum::<usize>();
+                out.extend_from_slice(&(totlen as u32).to_be_bytes());
+                let kind = match self.tp {
+                    0 => b"abs ",
+                    1 => b"rel ",
+                    2 => b"!pth",
+                    3 => b"unc ",
+                    _ => unreachable!("PTH2 path type is validated when parsed"),
+                };
+                out.extend_from_slice(kind);
+                for c in &self.comps {
+                    out.extend_from_slice(&(c.len() as u16).to_be_bytes());
+                    out.extend_from_slice(c);
+                }
+            }
+        }
+    }
+
+    fn pth0(tp: u16, comps: Vec<Vec<u8>>) -> Self {
+        Self { tp, comps, format: PthFormat::Pth0 { zero_length: false } }
+    }
+
+    fn with_path(&self, tp: u16, comps: Vec<Vec<u8>>) -> Self {
+        match self.format {
+            PthFormat::Pth0 { .. } => Self::pth0(tp, comps),
+            PthFormat::Pth2 => Self { tp, comps, format: PthFormat::Pth2 },
         }
     }
 
     pub fn token(comps: Vec<Vec<u8>>) -> Pth {
-        Pth { tp: 0, comps, zero: false }
+        Self::pth0(0, comps)
     }
 
     pub fn is_token(&self) -> bool {
@@ -574,12 +648,26 @@ pub struct LinkObj {
 }
 
 impl LinkObj {
-    /// LabVIEW links to the VINS copy by a relative basename qualified as Instance.
-    pub(crate) fn embedded_instance_name(&self) -> Option<&[u8]> {
-        let [qualifier, name] = self.qual.as_slice() else { return None };
-        let [path] = self.path.comps.as_slice() else { return None };
-        (matches!(&self.ident, b"VIVI" | b"IUVI") && self.flag == 1 && self.path.is_relative()
-            && qualifier == b"Instance" && path == name).then_some(name.as_slice())
+    /// A VINS reference qualifies each relative path component with Instance.
+    pub(crate) fn embedded_instance_path(&self) -> Option<&[Vec<u8>]> {
+        let path = self.path.comps.as_slice();
+        (matches!(&self.ident, b"VIVI" | b"IUVI")
+            && self.flag == 1
+            && self.path.is_relative()
+            && !path.is_empty()
+            && self.qual.len() == 2 * path.len()
+            && self.qual.chunks_exact(2).zip(path).all(|(pair, name)| {
+                pair[0].as_slice() == b"Instance" && &pair[1] == name
+            }))
+        .then_some(path)
+    }
+
+    pub(crate) fn is_embedded_owner(&self) -> bool {
+        self.ident == *b"IVOV"
+            && self.flag == 3
+            && self.qual.is_empty()
+            && self.path.is_relative()
+            && matches!(self.path.comps.as_slice(), [anchor] if anchor.is_empty())
     }
 }
 
@@ -594,7 +682,7 @@ fn pad_to(pos: usize, n: usize) -> usize {
     (n - pos % n) % n
 }
 
-/// Parse `ident | pad4 | qualname | pad2 | PTH0 | flag` at `pos` (the ident).
+/// Parse `ident | pad4 | qualname | pad2 | path | flag` at `pos` (the ident).
 fn parse_basic(b: &[u8], mut pos: usize, ver: (u32, u32)) -> Result<Basic> {
     let ident: [u8; 4] = b.get(pos..pos + 4).context("truncated ident")?.try_into()?;
     pos += 4;
@@ -745,7 +833,7 @@ struct ApiTail {
 /// A class and its direct parents, as the LabVIEW 2020 class list holds them.
 type ClassParents = (Vec<Vec<u8>>, Pth, Vec<(Vec<Vec<u8>>, Pth)>);
 
-/// `u32 m, qual×m, PTH0` at `q`: a class's qualified name and absolute path.
+/// `u32 m, qual×m, path` at `q`: a class's qualified name and absolute path.
 fn parse_class_ref(t: &[u8], q: &mut usize) -> Result<(Vec<Vec<u8>>, Pth)> {
     let m = be32(t, *q)? as usize;
     ensure!(m <= 64, "qualified name too long");
@@ -970,7 +1058,10 @@ fn reflow_dn_tail(o: &LinkObj, ver: (u32, u32), new_pos: usize, out: &mut Vec<u8
     }
     let k = pad_to(o.tail_pos + p, 2);
     ensure!(t.len() >= p + k && t[p..p + k].iter().all(|&x| x == 0), "assembly link pad is not zero");
-    ensure!(t.get(p + k..p + k + 4) == Some(b"PTH0"), "assembly link has no trailing path");
+    ensure!(
+        matches!(t.get(p + k..p + k + 4), Some(b"PTH0" | b"PTH2")),
+        "assembly link has no trailing path"
+    );
     out.extend_from_slice(&t[..p]);
     out.resize(out.len() + pad_to(new_pos + p, 2), 0);
     out.extend_from_slice(&t[p + k..]);
@@ -1712,7 +1803,7 @@ pub fn fix_vi(bytes: &[u8], vi_logical: &str, tree: &Tree, m: Methods) -> Result
                     && !o.path.is_token()
                     && let Some(tok) = link_token(&owner)
                 {
-                    o.path = Pth::token(tok);
+                    o.path = o.path.with_path(0, tok);
                     changes.owner += 1;
                     sec_changed = true;
                 }
@@ -1728,9 +1819,9 @@ pub fn fix_vi(bytes: &[u8], vi_logical: &str, tree: &Tree, m: Methods) -> Result
                 let from_build_machine = o.path.is_drive()
                     || resolve_relative(&vi_dir, &o.path.comps).is_none_or(|l| !l.eq_ignore_ascii_case(&target));
                 let new = match link_token(&target) {
-                    Some(tok) => Some(Pth::token(tok)),
+                    Some(tok) => Some(o.path.with_path(0, tok)),
                     None if from_build_machine && tree.same_root(vi_logical, &target) => {
-                        Some(Pth { tp: 1, comps: relative_comps(&vi_dir, &target), zero: false })
+                        Some(o.path.with_path(1, relative_comps(&vi_dir, &target)))
                     }
                     None => None,
                 };
@@ -2171,7 +2262,7 @@ mod tests {
         let mut o = LinkObj {
             ident: *b"VIVI",
             qual: vec![b"lib.*".to_vec()],
-            path: Pth { tp: 0, comps: vec![b"a".to_vec()], zero: false },
+            path: Pth::pth0(0, vec![b"a".to_vec()]),
             flag: 0,
             tail: Vec::new(),
             tail_pos: 0,
@@ -2420,7 +2511,7 @@ mod tests {
                 objs: callees.iter().map(|callee| LinkObj {
                     ident: *b"VIVI",
                     qual: vec![callee.as_bytes().to_vec()],
-                    path: Pth { tp: 1, comps: vec![Vec::new(), callee.as_bytes().to_vec()], zero: false },
+                    path: Pth::pth0(1, vec![Vec::new(), callee.as_bytes().to_vec()]),
                     flag: 0,
                     tail: Vec::new(),
                     tail_pos: 0,
@@ -2436,28 +2527,55 @@ mod tests {
         std::fs::write(root.join("Packed.lvlib"), r#"<Library><Item Name="Nested.lvlib" Type="Library" URL="../Nested.lvlib"/></Library>"#).unwrap();
         std::fs::write(root.join("Nested.lvlib"), r#"<Library><Item Name="Startup.vi" Type="VI" URL="../Startup.vi"/></Library>"#).unwrap();
 
-        // Replace the saved caller with an instance call. The embedded VI
-        // alone links to Sub.vi, and the instance basename has no disk file.
+        // A flattened reference reaches the nested VINS resource. Its link
+        // to Startup.vi's sibling crosses both virtual folders.
         let instance_name = b"instance.vi";
+        let nested_name = b"nested.vi";
         let startup_path = root.join("Startup.vi");
-        let mut embedded = Rsrc::parse(&std::fs::read(&startup_path).unwrap()).unwrap();
-        let name_field = embedded.section(b"LVSR").unwrap().off_field - 8;
-        let names_start = be32(&embedded.info, 16).unwrap() as usize - 32;
-        let name_offset = (embedded.info.len() - names_start) as u32;
-        embedded.info[name_field..name_field + 4].copy_from_slice(&name_offset.to_be_bytes());
-        embedded.info.push(instance_name.len() as u8);
-        embedded.info.extend_from_slice(instance_name);
+        let set_instance_name = |resource: &mut Rsrc, name: &[u8]| {
+            let name_field = resource.section(b"LVSR").unwrap().off_field - 8;
+            let names_start = be32(&resource.info, 16).unwrap() as usize - 32;
+            let name_offset = (resource.info.len() - names_start) as u32;
+            resource.info[name_field..name_field + 4].copy_from_slice(&name_offset.to_be_bytes());
+            resource.info.push(name.len() as u8);
+            resource.info.extend_from_slice(name);
+        };
+
+        let mut nested = Rsrc::parse(&std::fs::read(&startup_path).unwrap()).unwrap();
+        set_instance_name(&mut nested, nested_name);
+        let nested_section = nested.section_mut(b"LIvi").unwrap();
+        let mut nested_links = LinkSection::parse(&nested_section.data, version).unwrap();
+        nested_links.objs[0].path.comps.splice(0..0, [Vec::new(), Vec::new()]);
+        nested_section.data = nested_links.write(version, false).unwrap();
+
+        let mut embedded = vi.clone();
+        set_instance_name(&mut embedded, instance_name);
+        let owner_link = LinkObj {
+            ident: *b"IVOV",
+            qual: Vec::new(),
+            path: Pth::pth0(1, vec![Vec::new()]),
+            flag: 3,
+            tail: Vec::new(),
+            // Position after the flag for this sole object.
+            tail_pos: 37,
+        };
+        let links = LinkSection { list_ident: *b"LVIN", header_extra: Vec::new(), objs: vec![owner_link] };
+        embedded.edit_blocks(&[], Some((*b"LIvi", links.write(version, false).unwrap()))).unwrap();
+        embedded.edit_blocks(&[], Some((*b"VINS", nested.write()))).unwrap();
 
         let mut startup = vi.clone();
-        let link = LinkObj {
+        let direct = LinkObj {
             ident: *b"VIVI",
             qual: vec![b"Instance".to_vec(), instance_name.to_vec()],
-            path: Pth { tp: 1, comps: vec![instance_name.to_vec()], zero: false },
+            path: Pth::pth0(1, vec![instance_name.to_vec()]),
             flag: 1,
             tail: Vec::new(),
             tail_pos: 0,
         };
-        let links = LinkSection { list_ident: *b"LVIN", header_extra: Vec::new(), objs: vec![link] };
+        let mut flat = direct.clone();
+        flat.qual.extend([b"Instance".to_vec(), nested_name.to_vec()]);
+        flat.path.comps.push(nested_name.to_vec());
+        let links = LinkSection { list_ident: *b"LVIN", header_extra: Vec::new(), objs: vec![direct, flat] };
         startup.edit_blocks(&[], Some((*b"LIvi", links.write(version, false).unwrap()))).unwrap();
         let without_instance = startup.write();
         startup.edit_blocks(&[], Some((*b"VINS", embedded.write()))).unwrap();
@@ -2623,6 +2741,48 @@ mod tests {
     }
 
     #[test]
+    fn pth2_round_trips_utf8_and_leaves_the_fields_after_the_path() {
+        let record = b"\xffPTH2\0\0\0\x14rel \0\0\0\x0cR\xc3\xbccklauf.vi\xff";
+        let (path, end) = Pth::parse(record, 1).unwrap();
+        assert_eq!(end, record.len() - 1);
+        assert!(path.is_relative());
+        assert_eq!(path.comps, vec![Vec::new(), "Rücklauf.vi".as_bytes().to_vec()]);
+        let mut written = Vec::new();
+        path.write(&mut written);
+        assert_eq!(written, record[1..end]);
+
+        let replacement = path.with_path(0, vec![b"<vilib>".to_vec(), vec![b'a'; 300]]);
+        written.clear();
+        replacement.write(&mut written);
+        assert!(written.starts_with(b"PTH2"));
+        assert_eq!(Pth::parse(&written, 0).unwrap(), (replacement, written.len()));
+    }
+
+    #[test]
+    fn pth2_rejects_bad_lengths_and_path_types() {
+        for invalid in [
+            b"PTH2\0\0\0\x03rel ".as_slice(),
+            b"PTH2\0\0\0\x04????",
+            b"PTH2\0\0\0\x06rel ",
+            b"PTH2\0\0\0\x07rel \0\x02\xff",
+        ] {
+            assert!(Pth::parse(invalid, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn link_section_recognizes_pth2_after_a_pth0_object() {
+        let mut section = b"\0\x01LVIN\0\0\0\x02".to_vec();
+        section.extend_from_slice(b"\0\x02VIVI\0\0\0\0PTH0\0\0\0\x04\0\0\0\0\0\0\0\0\xff");
+        section.extend_from_slice(b"\0\x02VIVI\0\0\0\0\0PTH2\0\0\0\x04!pth\0\0\0\0");
+        section.extend_from_slice(b"\0\x03");
+        let links = LinkSection::parse(&section, (25, 0)).unwrap();
+        assert_eq!(links.objs.len(), 2);
+        assert_eq!(links.objs[1].path.tp, 2);
+        assert_eq!(links.write((25, 0), false).unwrap(), section);
+    }
+
+    #[test]
     fn relative_paths_resolve_like_labview() {
         let up = vec![b"".to_vec(), b"".to_vec(), b"JKI JSON Serialization.lvlib".to_vec()];
         assert_eq!(
@@ -2703,7 +2863,7 @@ mod tests {
         assert!(!tree.qualified_as(vi, &q(&["Old.lvlib", "Global.vi"]), false));
         assert!(tree.qualified_as(class, &q(&["C.lvclass", "\x07\x00"]), true));
         assert!(!tree.qualified_as(class, &q(&["D.lvclass", "\x07\x00"]), true));
-        let absolute = Pth { tp: 0, comps: q(&["C", "build", "Old", "Global.vi"]), zero: false };
+        let absolute = Pth::pth0(0, q(&["C", "build", "Old", "Global.vi"]));
         assert!(tree.only_one_qualified(&absolute, &q(&["Old.lvlib", "Global.vi"]), false).is_none());
         assert_eq!(tree.only_one_qualified(&absolute, &q(&["New.lvlib", "Global.vi"]), false), Some(vi.to_string()));
     }
