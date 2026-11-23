@@ -97,11 +97,17 @@ fn scan_sources(
         .map(linkfix::venv_roots)
         .transpose()?
         .unwrap_or_default();
+    let system_addons = labview
+        .as_ref()
+        .map(SystemAddons::discover)
+        .transpose()?
+        .unwrap_or_default();
     let locations = Locations {
         project_dir,
         labview_dir: labview_dir.as_deref(),
         venv_dir: venv_dir.as_deref(),
         addons: &addons,
+        system_addons: &system_addons,
     };
     let mut issues = BTreeSet::new();
     let (roots, project_dlls, expand_nested_members) = match sources {
@@ -208,6 +214,7 @@ pub(crate) fn scan_packed_files(project: &Path, files: BTreeSet<PathBuf>) -> Res
         labview_dir: None,
         venv_dir: None,
         addons: &[],
+        system_addons: &SystemAddons::default(),
     };
 
     let mut roots = BTreeSet::new();
@@ -359,11 +366,109 @@ impl PackedScan {
     }
 }
 
+#[derive(Default)]
+struct SystemAddons {
+    store: Option<PathBuf>,
+    roots: Vec<PathBuf>,
+}
+
+impl SystemAddons {
+    fn discover(target: &target::LvTarget) -> Result<Self> {
+        // Earlier LabVIEW installations cannot mount LVAddons.
+        if target.version < 22.3 {
+            return Ok(Self::default());
+        }
+        #[cfg(windows)]
+        let store = std::env::var_os("ProgramW6432")
+            .or_else(|| std::env::var_os("ProgramFiles"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+            .join(r"NI\LVAddons");
+        #[cfg(target_os = "linux")]
+        let store = PathBuf::from("/usr/local/natinst/share/lvaddons");
+        Self::read(&store, target)
+    }
+
+    fn read(store: &Path, target: &target::LvTarget) -> Result<Self> {
+        let store = match store.canonicalize() {
+            Ok(store) => store,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut roots = Vec::new();
+        for addon in std::fs::read_dir(&store)? {
+            let addon = addon?;
+            if !addon.file_type()?.is_dir() {
+                continue;
+            }
+            let mut compatible = Vec::new();
+            for release in std::fs::read_dir(addon.path())? {
+                let release = release?;
+                if !release.file_type()?.is_dir() {
+                    continue;
+                }
+                let Some(version) = numeric_addon_version(&release.file_name()) else {
+                    continue;
+                };
+                let path = release.path();
+                if AddonCompatibility::read(&path).is_some_and(|info| info.matches(target)) {
+                    compatible.push((version, path));
+                }
+            }
+            // The same physical add-on can retain older API versions.
+            if let Some((_, path)) = compatible.into_iter().max() {
+                roots.push(path);
+            }
+        }
+        roots.sort();
+        Ok(Self {
+            store: Some(store),
+            roots,
+        })
+    }
+}
+
+fn numeric_addon_version(name: &std::ffi::OsStr) -> Option<Vec<u32>> {
+    name.to_str()?
+        .split('.')
+        .map(str::parse)
+        .collect::<std::result::Result<_, _>>()
+        .ok()
+}
+
+#[derive(serde::Deserialize)]
+struct AddonCompatibility {
+    #[serde(rename = "MinimumSupportedLVVersion")]
+    minimum: String,
+    #[serde(rename = "SupportedBitness")]
+    bitness: Option<String>,
+}
+
+impl AddonCompatibility {
+    fn read(path: &Path) -> Option<Self> {
+        let bytes = std::fs::read(path.join("lvaddoninfo.json")).ok()?;
+        serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes)).ok()
+    }
+
+    fn matches(&self, target: &target::LvTarget) -> bool {
+        self.minimum
+            .parse::<f64>()
+            .is_ok_and(|minimum| minimum.is_finite() && minimum <= target.version)
+            && self
+                .bitness
+                .as_ref()
+                .is_none_or(|bitness| bitness.parse::<u8>().ok() == Some(target.bitness))
+    }
+}
+
 struct Locations<'a> {
     project_dir: &'a Path,
     labview_dir: Option<&'a Path>,
     venv_dir: Option<&'a Path>,
     addons: &'a [PathBuf],
+    system_addons: &'a SystemAddons,
 }
 
 impl Locations<'_> {
@@ -372,6 +477,7 @@ impl Locations<'_> {
             (self.venv_dir, "venv"),
             (Some(self.project_dir), "project"),
             (self.labview_dir, "labview"),
+            (self.system_addons.store.as_deref(), "lvaddons"),
         ] {
             if let Some(relative) = root.and_then(|root| path.strip_prefix(root).ok())
                 && !relative
@@ -420,19 +526,27 @@ impl Locations<'_> {
         if resolve_file(&base).is_some() || base.is_dir() {
             return Ok(base);
         }
-        // Two addons exporting the same file make package attribution ambiguous.
-        let mut candidates = self
-            .addons
-            .iter()
-            .map(|root| root.join(logical))
-            .filter_map(|path| resolve_file(&path).or_else(|| path.is_dir().then_some(path)));
-        let first = candidates.next();
-        ensure!(
-            candidates.next().is_none(),
-            "multiple venv addons provide {}",
-            slash(logical)
-        );
-        Ok(first.unwrap_or(base))
+        // Preserve the venv's lookup order before falling back to system add-ons.
+        for (roots, kind) in [
+            (self.addons, "venv"),
+            (self.system_addons.roots.as_slice(), "system"),
+        ] {
+            let mut candidates = roots
+                .iter()
+                .map(|root| root.join(logical))
+                .filter_map(|path| resolve_file(&path).or_else(|| path.is_dir().then_some(path)));
+            let Some(first) = candidates.next() else {
+                continue;
+            };
+            // Two add-ons in one search tier make attribution ambiguous.
+            ensure!(
+                candidates.next().is_none(),
+                "multiple {kind} addons provide {}",
+                slash(logical)
+            );
+            return Ok(first);
+        }
+        Ok(base)
     }
 
     fn url(&self, base: &Path, url: &str) -> Result<PathBuf> {
@@ -1029,6 +1143,7 @@ mod tests {
             labview_dir: Some(&labview),
             venv_dir: Some(&venv),
             addons: &[],
+            system_addons: &SystemAddons::default(),
         };
         assert_eq!(
             locations.label(&project.join("src/main.vi")),
@@ -1052,6 +1167,74 @@ mod tests {
     }
 
     #[test]
+    fn resolves_system_addons_for_the_selected_version_and_bitness() {
+        let root = std::env::temp_dir().join(format!("lvpm-system-addons-{}", std::process::id()));
+        let store = root.join("LVAddons");
+        let project = root.join("project");
+        let installation = root.join("LabVIEW");
+        let logical = Path::new("vi.lib/api.llb/Member.vi");
+        let make_addon = |release: &str, minimum: &str, bitness: Option<&str>, file: &str| {
+            let folder = store.join(release);
+            std::fs::create_dir_all(folder.join("vi.lib")).unwrap();
+            let info = serde_json::json!({
+                "AddonName": "driver",
+                "MinimumSupportedLVVersion": minimum,
+                "SupportedBitness": bitness,
+            });
+            std::fs::write(folder.join("lvaddoninfo.json"), info.to_string()).unwrap();
+            std::fs::write(folder.join(file), []).unwrap();
+        };
+
+        make_addon("common/1", "22.0", None, "vi.lib/api.llb");
+        make_addon("common/26.2", "26.0", None, "vi.lib/api.llb");
+        make_addon("common/26.10", "26.3", None, "vi.lib/api.llb");
+        make_addon("driver32/1", "22.0", Some("32"), "vi.lib/native.vi");
+        make_addon("driver64/1", "22.0", Some("64"), "vi.lib/native.vi");
+        let target = target::LvTarget {
+            version: 25.3,
+            bitness: 64,
+            path: installation.clone(),
+        };
+
+        let system_addons = SystemAddons::read(&store, &target).unwrap();
+        let locations = Locations {
+            project_dir: &project,
+            labview_dir: Some(&installation),
+            venv_dir: None,
+            addons: &[],
+            system_addons: &system_addons,
+        };
+        let mounted = system_addons.store.as_ref().unwrap();
+        let vi = locations.url(&root, "/<vilib>/api.llb/Member.vi").unwrap();
+        assert_eq!(vi, mounted.join("common/1").join(logical));
+        assert_eq!(
+            locations.label(&vi),
+            "lvaddons/common/1/vi.lib/api.llb/Member.vi"
+        );
+        assert_eq!(
+            locations.url(&root, "/<vilib>/native.vi").unwrap(),
+            mounted.join("driver64/1/vi.lib/native.vi")
+        );
+        assert_eq!(
+            locations.rebase(root.join("old/vi.lib").join("api.llb/Member.vi")).unwrap(),
+            vi
+        );
+
+        std::fs::create_dir_all(installation.join("vi.lib")).unwrap();
+        std::fs::write(installation.join("vi.lib/api.llb"), []).unwrap();
+        assert_eq!(
+            locations.url(&root, "/<vilib>/api.llb/Member.vi").unwrap(),
+            installation.join(logical)
+        );
+        let newer = target::LvTarget { version: 26.3, ..target };
+        assert_eq!(
+            SystemAddons::read(&store, &newer).unwrap().roots,
+            [mounted.join("common/26.10"), mounted.join("driver64/1")]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn resolves_venv_addons_without_shadowing_the_base_installation() {
         let root = std::env::temp_dir().join(format!("lvpm-vi-overlay-{}", std::process::id()));
         let installation = root.join("LabVIEW");
@@ -1069,6 +1252,7 @@ mod tests {
             labview_dir: Some(&installation),
             venv_dir: None,
             addons: &addons,
+            system_addons: &SystemAddons::default(),
         };
         let base = installation.join(logical);
         let first = addons[0].join(logical);
@@ -1088,6 +1272,7 @@ mod tests {
         assert_eq!(resolve().unwrap(), base);
         let global = Locations {
             addons: &[],
+            system_addons: &SystemAddons::default(),
             ..locations
         };
         std::fs::remove_file(&base).unwrap();

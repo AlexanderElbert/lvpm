@@ -74,38 +74,72 @@ pub struct Rsrc {
     pub sections: Vec<Section>,
 }
 
+struct SectionBytes<'a> {
+    ident: [u8; 4],
+    off_field: usize,
+    data_offset: usize,
+    data: &'a [u8],
+}
+
+fn rsrc_sections(b: &[u8]) -> Result<(&[u8], Vec<SectionBytes<'_>>)> {
+    ensure!(b.len() >= 32 && &b[..6] == b"RSRC\r\n", "not an RSRC file");
+    let info_off = be32(b, 16)? as usize;
+    let info_sz = be32(b, 20)? as usize;
+    let data_off = be32(b, 24)? as usize;
+    ensure!(data_off == 32, "unexpected data offset {data_off}");
+    let info_end = info_off.checked_add(info_sz).context("info table out of range")?;
+    let info = b.get(info_off..info_end).context("info table out of range")?;
+    ensure!(info.len() >= 52, "info table out of range");
+    ensure!(info[..32] == b[..32], "second RSRC header differs from the first");
+    let info = &info[32..];
+
+    // BlockInfoListHeader has offsets relative to the second RSRC header.
+    let base = (be32(info, 12)? as usize).checked_sub(32).context("blockinfo offset inside the header copy")?;
+    let block_count = (be32(info, base)? as usize).checked_add(1).context("invalid block count")?;
+    ensure!(block_count <= (info.len() - base - 4) / 12, "truncated block headers");
+    let mut sections = Vec::new();
+    for i in 0..block_count {
+        let hdr = base + 4 + 12 * i;
+        let ident = info[hdr..hdr + 4].try_into()?;
+        let count = (be32(info, hdr + 4)? as usize).checked_add(1).context("invalid section count")?;
+        let offset = base.checked_add(be32(info, hdr + 8)? as usize).context("section table out of range")?;
+        let table = info.get(offset..).context("section table out of range")?;
+        ensure!(count <= table.len() / 20, "truncated section table");
+        for j in 0..count {
+            let off_field = offset + 20 * j + 12;
+            let data_offset = data_off.checked_add(be32(info, off_field)? as usize).context("section data out of range")?;
+            let data = b.get(data_offset..).context("section data out of range")?;
+            let size = be32(data, 0)? as usize;
+            let data = data[4..].get(..size).context("section data out of range")?;
+            sections.push(SectionBytes { ident, off_field, data_offset, data });
+        }
+    }
+    sections.sort_by_key(|section| section.data_offset);
+    Ok((info, sections))
+}
+
+fn rsrc_section_name(info: &[u8], off_field: usize) -> Option<&[u8]> {
+    // The section's name offset precedes its data offset by eight bytes.
+    // Names are Pascal strings after the block list.
+    let offset = be32(info, off_field.checked_sub(8)?).ok()?;
+    if offset == u32::MAX {
+        return None;
+    }
+    let table = (be32(info, 16).ok()? as usize).checked_sub(32)?;
+    let start = table.checked_add(offset as usize)?;
+    let (&len, bytes) = info.get(start..)?.split_first()?;
+    bytes.get(..usize::from(len))
+}
+
 impl Rsrc {
     pub fn parse(b: &[u8]) -> Result<Rsrc> {
-        ensure!(b.len() >= 32 && &b[..6] == b"RSRC\r\n", "not an RSRC file");
-        let info_off = be32(b, 16)? as usize;
-        let info_sz = be32(b, 20)? as usize;
-        let data_off = be32(b, 24)? as usize;
-        ensure!(data_off == 32, "unexpected data offset {data_off}");
-        ensure!(info_off + info_sz <= b.len() && info_sz >= 52, "info table out of range");
-        ensure!(b[info_off..info_off + 32] == b[..32], "second RSRC header differs from the first");
-        let info = b[info_off + 32..info_off + info_sz].to_vec();
-        // BlockInfoListHeader: int1, int2, int3, blockinfo_offset, blockinfo_size.
-        let base = be32(&info, 12)? as usize;
-        ensure!(base >= 32, "blockinfo offset inside the header copy");
-        let base = base - 32;
-        let nblocks = be32(&info, base)? as usize + 1;
-        let mut sections = Vec::new();
-        for i in 0..nblocks {
-            let hdr = base + 4 + 12 * i;
-            let ident: [u8; 4] = info.get(hdr..hdr + 4).context("truncated block header")?.try_into()?;
-            let scount = be32(&info, hdr + 4)? as usize + 1;
-            let soff = be32(&info, hdr + 8)? as usize;
-            for j in 0..scount {
-                let st = base + soff + 20 * j;
-                let doff = be32(&info, st + 12)? as usize;
-                let pos = data_off + doff;
-                let size = be32(b, pos)? as usize;
-                ensure!(pos + 4 + size <= b.len(), "section {} data out of range", String::from_utf8_lossy(&ident));
-                sections.push((doff, Section { ident, off_field: st + 12, data: b[pos + 4..pos + 4 + size].to_vec() }));
-            }
-        }
-        sections.sort_by_key(|(doff, _)| *doff);
-        Ok(Rsrc { head: b[..32].try_into()?, info, sections: sections.into_iter().map(|(_, s)| s).collect() })
+        let (info, sections) = rsrc_sections(b)?;
+        let sections = sections.into_iter().map(|section| Section {
+            ident: section.ident,
+            off_field: section.off_field,
+            data: section.data.to_vec(),
+        }).collect();
+        Ok(Rsrc { head: b[..32].try_into()?, info: info.to_vec(), sections })
     }
 
     pub fn write(&self) -> Vec<u8> {
@@ -152,16 +186,7 @@ impl Rsrc {
     }
 
     fn section_name(&self, section: &Section) -> Option<&[u8]> {
-        // The section's name offset precedes its data offset by eight bytes.
-        // Names are Pascal strings after the block list.
-        let offset = be32(&self.info, section.off_field.checked_sub(8)?).ok()?;
-        if offset == u32::MAX {
-            return None;
-        }
-        let names = (be32(&self.info, 16).ok()? as usize).checked_sub(32)?;
-        let start = names.checked_add(offset as usize)?;
-        let (&len, bytes) = self.info.get(start..)?.split_first()?;
-        bytes.get(..usize::from(len))
+        rsrc_section_name(&self.info, section.off_field)
     }
 
     /// (major, minor) from the `LVSR` block, e.g. (20, 0) for LabVIEW 2020.
@@ -1425,12 +1450,32 @@ fn resolve_relative(vi_dir: &str, comps: &[Vec<u8>]) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// The files inside an LLB: (name with extension, bytes). An LLB is an RSRC
-/// container (type `LVAR`) with its members laid out verbatim, each a whole
-/// RSRC file whose second header copy sits at its own info offset — that
-/// copy is what tells a real member start from a stray `RSRC` string. The
-/// name comes from the member's `TITL` block.
+/// Return a filename and borrowed resource bytes for each VI or control in an LLB.
 pub(crate) fn llb_members(data: &[u8]) -> Vec<(String, &[u8])> {
+    if data.get(8..12) == Some(b"LVAR")
+        && let Ok((info, sections)) = rsrc_sections(data)
+    {
+        let named: Vec<_> = sections.into_iter().filter_map(|section| {
+            if &section.ident != b"UCRF" || !section.data.starts_with(b"RSRC\r\n") {
+                return None;
+            }
+            // LVAR's uncompressed resources have the real filename in the
+            // outer name table, including when the VI has no TITL block.
+            let name = rsrc_section_name(info, section.off_field)?;
+            if name.is_empty() || name == b"." || name == b".."
+                || name.iter().any(|&byte| matches!(byte, b'/' | b'\\' | b':' | b'\0'))
+            {
+                return None;
+            }
+            Some((String::from_utf8_lossy(name).into_owned(), section.data))
+        }).collect();
+        if !named.is_empty() {
+            return named;
+        }
+    }
+
+    // Legacy fallback: find verbatim nested resources by their duplicate
+    // RSRC header and recover the filename from the member's TITL block.
     let mut out = Vec::new();
     let mut i = match data.len() > 6 { true => 1, false => return out };
     while let Some(off) = data[i..].windows(6).position(|w| w == b"RSRC\r\n") {
@@ -2249,6 +2294,37 @@ pub fn summarize(outcomes: &[Outcome]) -> BTreeMap<&'static str, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llb_uses_the_outer_name_for_a_member_without_a_title_block() {
+        fn resource(file_type: [u8; 4], block: [u8; 4], name: &[u8], payload: Vec<u8>) -> Vec<u8> {
+            let mut head = [0; 32];
+            head[..6].copy_from_slice(b"RSRC\r\n");
+            head[8..12].copy_from_slice(&file_type);
+            let mut info = vec![0; 56];
+            info[12..16].copy_from_slice(&52u32.to_be_bytes());
+            info[16..20].copy_from_slice(&88u32.to_be_bytes());
+            info[24..28].copy_from_slice(&block);
+            info[32..36].copy_from_slice(&16u32.to_be_bytes());
+            info.push(name.len() as u8);
+            info.extend_from_slice(name);
+            let sections = vec![Section { ident: block, off_field: 48, data: payload }];
+            Rsrc { head, info, sections }.write()
+        }
+
+        let member = resource(*b"LVIN", *b"LVSR", b"", vec![0; 4]);
+        let llb = resource(*b"LVAR", *b"UCRF", b"Directory Name.vi", member.clone());
+        assert_eq!(llb_members(&llb), vec![("Directory Name.vi".to_owned(), member.as_slice())]);
+
+        // These section names are paths or special components on at least one platform.
+        for name in [b"../Bad.vi".as_slice(), b"..\\Bad.vi", b"C:Bad.vi", b".", b"..", b"Bad\0Name.vi"] {
+            let llb = resource(*b"LVAR", *b"UCRF", name, member.clone());
+            let entries = llb_members(&llb);
+            assert_eq!(entries.len(), 1);
+            assert!(entries[0].0.starts_with("member@"));
+            assert_eq!(entries[0].1, member.as_slice());
+        }
+    }
 
     #[test]
     fn the_heap_is_inflated_only_when_a_call_library_link_reads_it() {
